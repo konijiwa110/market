@@ -74,7 +74,10 @@ try {
         }
     }
 
-    $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+    # 写 UTF8 无 BOM：PS5.1 的 Set-Content -Encoding UTF8 会带 BOM，
+    # 导致代理(server.py)用 utf-8 读 settings.json 解析失败、退回默认上游。
+    $json = $settings | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText($SettingsFile, $json, (New-Object System.Text.UTF8Encoding($false)))
 } catch {
     Log "WARNING: Could not update settings.json: $_"
 }

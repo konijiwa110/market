@@ -44,7 +44,9 @@ def _load_config() -> dict:
     """读取 ~/.claude/rolling-context.json：第三方 baseURL 与压缩参数的显式、稳定来源。"""
     try:
         p = os.path.join(os.path.expanduser("~"), ".claude", "rolling-context.json")
-        with open(p, encoding="utf-8") as f:
+        # utf-8-sig：容忍 BOM。Windows PowerShell 写出的 json 常带 UTF8 BOM，
+        # 纯 utf-8 读会抛 JSONDecodeError 被吞掉，导致配置/上游解析失败。
+        with open(p, encoding="utf-8-sig") as f:
             c = json.load(f)
             return c if isinstance(c, dict) else {}
     except Exception:
@@ -83,7 +85,9 @@ def _load_upstream() -> str:
         return up
     try:
         settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
-        with open(settings_path, encoding="utf-8") as f:
+        # utf-8-sig：settings.json 可能由 PowerShell 写出带 BOM，纯 utf-8 会解析失败
+        # 而退回 api.anthropic.com（用第三方 token 打 Anthropic → 403）。
+        with open(settings_path, encoding="utf-8-sig") as f:
             env_vars = (json.load(f) or {}).get("env", {}) or {}
         up = env_vars.get("ROLLING_CONTEXT_UPSTREAM")
         if up:
