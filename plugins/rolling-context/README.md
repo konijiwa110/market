@@ -30,14 +30,14 @@ Claude Code  ──►  Rolling Context Proxy (:5588)  ──►  Upstream API
 
 ```
 /plugin marketplace add konijiwa110/market
-/plugin install rolling-context@market
+/plugin install rolling-context@konijiwa-plugin
 ```
 
 Or from the terminal:
 
 ```
 claude plugin marketplace add konijiwa110/market
-claude plugin install rolling-context@market
+claude plugin install rolling-context@konijiwa-plugin
 ```
 
 On the **first start**, the SessionStart hook configures `ANTHROPIC_BASE_URL` and starts the proxy. Since the env var only takes effect on the next terminal, **restart your terminal once** — after that everything works automatically. Requires Python 3.7+ (no pip install needed — pure stdlib).
@@ -99,7 +99,7 @@ curl http://127.0.0.1:5588/debug/compressions
 ## Uninstall
 
 ```
-claude plugin uninstall rolling-context@market
+claude plugin uninstall rolling-context@konijiwa-plugin
 ```
 
 ## License

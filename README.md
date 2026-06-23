@@ -1,4 +1,4 @@
-# market
+# konijiwa-plugin
 
 Personal Claude Code plugin marketplace.
 
@@ -23,5 +23,5 @@ claude plugin marketplace add konijiwa110/market
 ## Install a plugin
 
 ```
-/plugin install rolling-context@market
+/plugin install rolling-context@konijiwa-plugin
 ```
