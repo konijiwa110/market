@@ -357,6 +357,27 @@ def _validate_tool_pairs(messages: list) -> list:
     return messages[valid_from:]
 
 
+def _mark_cache_breakpoint(msg: dict) -> bool:
+    """在单条消息末尾打一个 ephemeral cache_control 断点,作为增量缓存锚点。返回是否打上。
+
+    cache_control 只能挂在 content block 上:content 为字符串时先转成单个 text block;
+    为 block 列表时从末尾找第一个可缓存类型(text/tool_result/tool_use)挂上——跳过
+    thinking 等不可挂断点的块,避免上游 400。
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        msg["content"] = [{
+            "type": "text", "text": content, "cache_control": {"type": "ephemeral"},
+        }]
+        return True
+    if isinstance(content, list):
+        for block in reversed(content):
+            if isinstance(block, dict) and block.get("type") in ("text", "tool_result", "tool_use"):
+                block["cache_control"] = {"type": "ephemeral"}
+                return True
+    return False
+
+
 def _do_background_compression(entry: dict, messages: list, auth_headers: dict, real_token_count: int = None):
     """Compress messages. Key = hashes of messages that were summarized (not kept verbatim)."""
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
@@ -593,36 +614,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 原逻辑删光 merged 里所有 cache_control,导致整个 messages 无断点 → 上游不缓存,
             # 每个注入轮按全新输入计费(只剩 system+tools 命中)。改为:先删净旧断点(避免位置失效 /
             # 超过 4 个上限),再在两个稳定边界各打一个 ephemeral:
-            #   1) 摘要前缀末尾(ack):promote 后不变 → 缓存 system+tools+summary+ack 这一大段,后续注入轮直接命中
-            #   2) 末条消息:近端尾巴在 5min 窗口内跨轮 cache_read
+            #   1) 摘要前缀末尾(ack,merged[1]):promote 后不变 → 缓存 system+tools+summary+ack 这一大段
+            #   2) 末条消息(merged[-1]):近端尾巴在 5min 窗口内跨轮 cache_read
+            # 断点总数 = system + tools + 2 ≤ 4,不触发上游 400。
             for msg in merged:
                 content = msg.get("content", "")
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict):
                             block.pop("cache_control", None)
-
-            def _mark_cache(msg: dict) -> bool:
-                """在消息末尾打 ephemeral 断点;string content 先转 block 形态(cache_control 只能挂在 block 上)。"""
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    msg["content"] = [{
-                        "type": "text", "text": content,
-                        "cache_control": {"type": "ephemeral"},
-                    }]
-                    return True
-                if isinstance(content, list):
-                    for block in reversed(content):
-                        if isinstance(block, dict) and block.get("type") in ("text", "tool_result", "tool_use"):
-                            block["cache_control"] = {"type": "ephemeral"}
-                            return True
-                return False
-
-            # prefix=[summary, ack],注入后占 merged[0:2];ack(merged[1])是稳定摘要前缀的末尾。
             if len(merged) >= 2:
-                _mark_cache(merged[1])
+                _mark_cache_breakpoint(merged[1])
             if merged:
-                _mark_cache(merged[-1])
+                _mark_cache_breakpoint(merged[-1])
 
             merged_chars = compressor._count_chars(merged)
             if merged_chars < msg_chars:
@@ -712,14 +716,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         # Anthropic native: usage in message_start.message.usage
                         if evt_type == "message_start":
                             usage = data.get("message", {}).get("usage", {})
+                            cache_read = usage.get("cache_read_input_tokens", 0)
+                            cache_create = usage.get("cache_creation_input_tokens", 0)
                             tokens = (
                                 usage.get("input_tokens", 0)
-                                + usage.get("cache_creation_input_tokens", 0)
-                                + usage.get("cache_read_input_tokens", 0)
+                                + cache_create
+                                + cache_read
                             )
                             if tokens > 0:
                                 total_input = tokens
-                                log.info(f"[MSG] Input tokens from message_start: {total_input:,}")
+                                log.info(
+                                    f"[MSG] Input tokens from message_start: {total_input:,} "
+                                    f"(cache_read={cache_read:,} cache_create={cache_create:,} "
+                                    f"input={usage.get('input_tokens', 0):,})"
+                                )
 
                         # Proxy/converter: usage in message_delta.usage (e.g. CodeGate)
                         elif evt_type == "message_delta":
