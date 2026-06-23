@@ -1,0 +1,9 @@
+{
+  "name": "rolling-context",
+  "version": "1.7.3",
+  "description": "Rolling context compression with third-party baseURL support — old messages get summarized, recent messages stay verbatim. Never hit the context wall.",
+  "author": {
+    "name": "konijiwa110"
+  },
+  "homepage": "https://github.com/konijiwa110/market"
+}
