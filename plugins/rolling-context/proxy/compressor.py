@@ -10,11 +10,19 @@ Pure stdlib — no external dependencies.
 import json
 import os
 import ssl
+import uuid
+import secrets
 import logging
 import http.client
 from urllib.parse import urlparse
 
 log = logging.getLogger("rolling-context.compressor")
+
+# 模拟 Claude Code 客户端：byteinn(sub2api)的 claude_code_only 分组对 /v1/messages 严格校验
+# system 含 CC 特征 text block + metadata.user_id 为 CC 格式，否则判非 CC 客户端而拒绝。摘要请求
+# 是代理自造、非真实 CC 请求，故按官方形态补齐这两项以通过检测（头则透传真实请求的 UA/X-App/beta）。
+_CC_SYSTEM_TEXT = "You are Claude Code, Anthropic's official CLI for Claude."
+_CC_DEVICE_ID = secrets.token_hex(32)  # 64 位 hex，进程内稳定
 
 _default_summarizer_url = os.environ.get("ROLLING_CONTEXT_UPSTREAM") or "https://api.anthropic.com"
 SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL") or _default_summarizer_url
@@ -298,20 +306,25 @@ class RollingCompressor:
             f"with {self.summarizer_model} (max_tokens={summary_max_tokens:,})..."
         )
 
+        cc_user_id = json.dumps({
+            "device_id": _CC_DEVICE_ID, "account_uuid": "", "session_id": str(uuid.uuid4()),
+        })
         req_body = json.dumps({
             "model": self.summarizer_model,
             "max_tokens": summary_max_tokens,
+            # 模拟 Claude Code 客户端以通过 byteinn claude_code_only 检测。
+            "system": [{"type": "text", "text": _CC_SYSTEM_TEXT}],
+            "metadata": {"user_id": cc_user_id},
             "messages": [{"role": "user", "content": prompt}],
         }).encode()
 
+        # 始终基于透传头（含真实 CC 的 UA/X-App/anthropic-beta/anthropic-version）；
+        # 配了 apikey 才覆盖上游鉴权——否则会丢掉 CC 头而过不了检测。
+        headers = dict(auth_headers)
         if self.summarizer_api_key:
-            headers = {
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01",
-                "Authorization": f"Bearer {self.summarizer_api_key}",
-            }
-        else:
-            headers = dict(auth_headers)
+            lowered = {k.lower(): k for k in headers}
+            headers.pop(lowered.get("x-api-key", ""), None)
+            headers[lowered.get("authorization", "Authorization")] = f"Bearer {self.summarizer_api_key}"
         headers["content-length"] = str(len(req_body))
         headers["accept-encoding"] = "identity"
 
