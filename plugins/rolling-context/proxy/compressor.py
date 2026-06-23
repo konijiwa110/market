@@ -270,10 +270,18 @@ class RollingCompressor:
 
         keep_from_idx = self._find_keep_index(messages, keep_ratio)
 
+        # 切点须落在干净 user 边界：Claude Code 会在 messages 间插入独立 role:system 消息，
+        # 保留段以 system/assistant/孤立 tool_result 开头时，注入后紧跟 ack(assistant) 会违反
+        # 「system 须跟 user 后 / 角色需交替」→ 上游 400。推进到下一个干净 user 边界。
+        while keep_from_idx < len(messages) and (
+            messages[keep_from_idx].get("role") != "user" or self._has_tool_result(messages[keep_from_idx])
+        ):
+            keep_from_idx += 1
+
         has_existing_summary = self._has_summary(messages)
         start_idx = 2 if has_existing_summary else 0
 
-        if keep_from_idx <= start_idx:
+        if keep_from_idx <= start_idx or keep_from_idx >= len(messages):
             log.info("Not enough old messages to compress, passing through")
             return messages
 
