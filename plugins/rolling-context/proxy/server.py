@@ -458,7 +458,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             total_bytes = 0
             while True:
-                chunk = resp.read(8192)
+                # read1: 单次 socket 读有多少返回多少,不凑满 8KB 才返回。
+                # 对 chunked SSE,每个事件到立刻 flush,流式与直连一致顺畅。
+                chunk = resp.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -686,7 +688,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             total_bytes = 0
             total_input = 0
             while True:
-                chunk = resp.read(8192)
+                # read1: 同上,逐 SSE 事件即时 flush,消除 8KB 批缓冲卡顿。
+                chunk = resp.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
