@@ -589,13 +589,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
             merged = match["prefix"] + new_messages
             merged = _validate_tool_pairs(merged)
 
-            # Strip cache_control from injected messages
+            # 注入后重建缓存断点,而非留下「零断点」。
+            # 原逻辑删光 merged 里所有 cache_control,导致整个 messages 无断点 → 上游不缓存,
+            # 每个注入轮按全新输入计费(只剩 system+tools 命中)。改为:先删净旧断点(避免位置失效 /
+            # 超过 4 个上限),再在两个稳定边界各打一个 ephemeral:
+            #   1) 摘要前缀末尾(ack):promote 后不变 → 缓存 system+tools+summary+ack 这一大段,后续注入轮直接命中
+            #   2) 末条消息:近端尾巴在 5min 窗口内跨轮 cache_read
             for msg in merged:
                 content = msg.get("content", "")
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict):
                             block.pop("cache_control", None)
+
+            def _mark_cache(msg: dict) -> bool:
+                """在消息末尾打 ephemeral 断点;string content 先转 block 形态(cache_control 只能挂在 block 上)。"""
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    msg["content"] = [{
+                        "type": "text", "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }]
+                    return True
+                if isinstance(content, list):
+                    for block in reversed(content):
+                        if isinstance(block, dict) and block.get("type") in ("text", "tool_result", "tool_use"):
+                            block["cache_control"] = {"type": "ephemeral"}
+                            return True
+                return False
+
+            # prefix=[summary, ack],注入后占 merged[0:2];ack(merged[1])是稳定摘要前缀的末尾。
+            if len(merged) >= 2:
+                _mark_cache(merged[1])
+            if merged:
+                _mark_cache(merged[-1])
 
             merged_chars = compressor._count_chars(merged)
             if merged_chars < msg_chars:
