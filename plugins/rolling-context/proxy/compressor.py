@@ -11,6 +11,8 @@ import json
 import os
 import ssl
 import uuid
+import gzip
+import zlib
 import secrets
 import logging
 import http.client
@@ -18,7 +20,7 @@ from urllib.parse import urlparse
 
 log = logging.getLogger("rolling-context.compressor")
 
-# 模拟 Claude Code 客户端：byteinn(sub2api)的 claude_code_only 分组对 /v1/messages 严格校验
+# 模拟 Claude Code 客户端：部分第三方中转网关的 claude_code_only 分组对 /v1/messages 严格校验
 # system 含 CC 特征 text block + metadata.user_id 为 CC 格式，否则判非 CC 客户端而拒绝。摘要请求
 # 是代理自造、非真实 CC 请求，故按官方形态补齐这两项以通过检测（头则透传真实请求的 UA/X-App/beta）。
 _CC_SYSTEM_TEXT = "You are Claude Code, Anthropic's official CLI for Claude."
@@ -312,7 +314,7 @@ class RollingCompressor:
         req_body = json.dumps({
             "model": self.summarizer_model,
             "max_tokens": summary_max_tokens,
-            # 模拟 Claude Code 客户端以通过 byteinn claude_code_only 检测。
+            # 模拟 Claude Code 客户端以通过上游 claude_code_only 检测。
             "system": [{"type": "text", "text": _CC_SYSTEM_TEXT}],
             "metadata": {"user_id": cc_user_id},
             "messages": [{"role": "user", "content": prompt}],
@@ -325,6 +327,10 @@ class RollingCompressor:
             lowered = {k.lower(): k for k in headers}
             headers.pop(lowered.get("x-api-key", ""), None)
             headers[lowered.get("authorization", "Authorization")] = f"Bearer {self.summarizer_api_key}"
+        # 透传头里 content-length/accept-encoding 多为首字母大写；dict 大小写敏感，直接用小写键设置会
+        # 与原键并存导致发送重复头（上游会取到带 gzip 的那个）。先按大小写无关删净，再统一覆盖。
+        for k in [k for k in headers if k.lower() in ("content-length", "accept-encoding")]:
+            headers.pop(k)
         headers["content-length"] = str(len(req_body))
         headers["accept-encoding"] = "identity"
 
@@ -335,7 +341,14 @@ class RollingCompressor:
         conn.request("POST", summarizer_path, body=req_body, headers=headers)
         resp = conn.getresponse()
         resp_body = resp.read()
+        enc = (resp.getheader("Content-Encoding") or "").lower()
         conn.close()
+
+        # 上游可能无视 accept-encoding:identity 仍回 gzip/deflate，按 Content-Encoding 解压兜底。
+        if "gzip" in enc:
+            resp_body = gzip.decompress(resp_body)
+        elif "deflate" in enc:
+            resp_body = zlib.decompress(resp_body)
 
         if resp.status != 200:
             error = resp_body.decode("utf-8", errors="replace")
