@@ -30,13 +30,42 @@ class FlushFileHandler(logging.FileHandler):
         super().emit(record)
         self.flush()
 
+
+# 会话级日志:多会话共用一个代理进程、一份日志,扁平日志无法区分是哪个会话、停在哪一步。
+# 用线程本地保存「会话标签」,再用 Filter 把它注入每条日志记录——这样所有日志(含 [BG]/[MATCH]/
+# 压缩器子 logger)都自动带上标签,无需逐条改 log 调用。
+_sess_ctx = threading.local()
+
+
+def _set_sess(tag: str):
+    _sess_ctx.tag = tag
+
+
+def _get_sess() -> str:
+    return getattr(_sess_ctx, "tag", "--------")
+
+
+class _SessionFilter(logging.Filter):
+    """把当前线程的会话标签与短线程 id 注入日志记录,供 formatter 使用。"""
+    def filter(self, record):
+        record.sess = _get_sess()
+        record.tid = threading.get_ident() % 100000
+        return True
+
+
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(sess)s|t%(tid)05d] %(message)s"
+_sess_filter = _SessionFilter()
+
 _log_path = os.path.join(os.path.expanduser("~"), ".claude", "rolling-context-debug.log")
 _log_handler = FlushFileHandler(_log_path, mode="a")
-_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_log_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+_log_handler.addFilter(_sess_filter)
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+_stream_handler.addFilter(_sess_filter)
 logging.basicConfig(
     level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout), _log_handler],
+    handlers=[_stream_handler, _log_handler],
 )
 log = logging.getLogger("rolling-context")
 
@@ -378,8 +407,10 @@ def _mark_cache_breakpoint(msg: dict) -> bool:
     return False
 
 
-def _do_background_compression(entry: dict, messages: list, auth_headers: dict, real_token_count: int = None):
+def _do_background_compression(entry: dict, messages: list, auth_headers: dict, real_token_count: int = None, sess: str = "--------"):
     """Compress messages. Key = hashes of messages that were summarized (not kept verbatim)."""
+    # 后台线程不继承请求线程的会话标签,显式重设,使 [BG]/压缩器日志归属到发起会话。
+    _set_sess(sess)
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
         compressed = compressor.compress(messages, auth_headers, real_token_count=real_token_count)
@@ -425,6 +456,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _get_headers_dict(self) -> dict:
         return {key: value for key, value in self.headers.items()}
+
+    def _tag_session(self):
+        """从 X-Claude-Code-Session-Id 取会话标签(UUID 前 8 位),设进线程本地,供日志区分会话。"""
+        sid = self.headers.get("X-Claude-Code-Session-Id", "") or ""
+        _set_sess(sid[:8] if sid else "no-sess-")
 
     def _proxy_raw(self, method: str):
         """Raw proxy — forward request and stream response back."""
@@ -479,6 +515,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(error_body)
 
     def do_GET(self):
+        self._tag_session()
         log.info(f"[REQ] GET {self.path}")
         parsed = urlparse(self.path)
         normalized_path = parsed.path
@@ -490,6 +527,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._proxy_raw("GET")
 
     def do_POST(self):
+        self._tag_session()
         log.info(f"[REQ] POST {self.path}")
         if self.path.startswith("/v1/messages"):
             self._handle_messages()
@@ -497,18 +535,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._proxy_raw("POST")
 
     def do_PUT(self):
+        self._tag_session()
         log.info(f"[REQ] PUT {self.path}")
         self._proxy_raw("PUT")
 
     def do_DELETE(self):
+        self._tag_session()
         log.info(f"[REQ] DELETE {self.path}")
         self._proxy_raw("DELETE")
 
     def do_PATCH(self):
+        self._tag_session()
         log.info(f"[REQ] PATCH {self.path}")
         self._proxy_raw("PATCH")
 
     def do_OPTIONS(self):
+        self._tag_session()
         log.info(f"[REQ] OPTIONS {self.path}")
         self._proxy_raw("OPTIONS")
 
@@ -789,7 +831,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),
-                        kwargs={"real_token_count": total_input},
+                        kwargs={"real_token_count": total_input, "sess": _get_sess()},
                         daemon=True,
                     )
                     t.start()
