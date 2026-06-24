@@ -631,6 +631,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f"messages={len(messages)} chars={msg_chars:,}"
         )
 
+        # 诊断:拆解请求体各部分占比,定位「真实 token 到底在哪」(system / tools / 消息 / 图片)。
+        # _count_chars 只看 messages,system 和 tools 不在其内——这一行用 JSON 字节长度近似各部分大小
+        # (≈4 字节/token),据此判断压缩计量盲区是图片还是 system+tools。只读,不改行为。
+        try:
+            sys_bytes = len(json.dumps(payload.get("system", ""), ensure_ascii=False))
+            tools_bytes = len(json.dumps(payload.get("tools", []), ensure_ascii=False))
+            n_tools = len(payload.get("tools", []) or [])
+            img_count = sum(
+                1
+                for m in messages if isinstance(m.get("content"), list)
+                for b in m["content"] if isinstance(b, dict)
+                for s in ([b] if b.get("type") == "image"
+                          else (b.get("content", []) if b.get("type") == "tool_result"
+                                and isinstance(b.get("content"), list) else []))
+                if isinstance(s, dict) and s.get("type") == "image"
+            )
+            log.info(
+                f"[MSG] breakdown: body={len(raw_body):,}B "
+                f"system={sys_bytes:,}B tools={tools_bytes:,}B({n_tools} tools) "
+                f"msg_count_chars={msg_chars:,} images={img_count} "
+                f"(≈{len(raw_body)//4:,} tok @4B/tok)"
+            )
+        except Exception as e:
+            log.debug(f"[MSG] breakdown failed: {e}")
+
         # Promote any pending compressions
         for entry in store.compressions:
             if entry["pending"] is not None:

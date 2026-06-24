@@ -148,8 +148,21 @@ class RollingCompressor:
             return http.client.HTTPSConnection(self._host, self._port or 443, context=ssl_ctx, timeout=120)
         return http.client.HTTPConnection(self._host, self._port or 80, timeout=120)
 
+    @staticmethod
+    def _image_chars(source) -> int:
+        """图片块的「字符当量」:按 base64 长度估 token、封顶 1600(Anthropic 单图 token 量级上限),
+        再 ×4 换算成与文本同尺度的字符数。
+
+        原 _count_chars 完全不计图片,而浏览器/DevTools/设计类会话里截图常占内容的 50%+(实测两个
+        大会话分别 48.9% / 58.7%),致压缩计量对 token 大头失明:keep_ratio 失真、切点几乎不切,
+        每轮空转。这里只求与真实 token 大致成比例,精度不苛求(无图片尺寸,只能据 base64 长度估)。
+        """
+        b64 = source.get("data", "") if isinstance(source, dict) else ""
+        tokens = min(1600, max(1, len(b64) // 1000))
+        return tokens * 4
+
     def _count_chars(self, messages: list) -> int:
-        """Count total characters across all messages."""
+        """统计全部消息的「字符当量」(文本按实际长度,图片按 _image_chars 估算),用于压缩切点/触发判断。"""
         total_chars = 0
         for msg in messages:
             content = msg.get("content", "")
@@ -158,18 +171,26 @@ class RollingCompressor:
             elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict):
-                        if block.get("type") == "text":
+                        btype = block.get("type")
+                        if btype == "text":
                             total_chars += len(block.get("text", ""))
-                        elif block.get("type") == "tool_use":
+                        elif btype == "thinking":
+                            total_chars += len(block.get("thinking", ""))
+                        elif btype == "image":
+                            total_chars += self._image_chars(block.get("source", {}))
+                        elif btype == "tool_use":
                             total_chars += len(json.dumps(block.get("input", {})))
-                        elif block.get("type") == "tool_result":
+                        elif btype == "tool_result":
                             c = block.get("content", "")
                             if isinstance(c, str):
                                 total_chars += len(c)
                             elif isinstance(c, list):
                                 for sub in c:
                                     if isinstance(sub, dict):
-                                        total_chars += len(sub.get("text", ""))
+                                        if sub.get("type") == "image":
+                                            total_chars += self._image_chars(sub.get("source", {}))
+                                        else:
+                                            total_chars += len(sub.get("text", ""))
         return total_chars
 
     def _find_keep_index(self, messages: list, keep_ratio: float) -> int:

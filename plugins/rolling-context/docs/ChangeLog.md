@@ -1,5 +1,35 @@
 # ChangeLog
 
+## 1.7.12 — 压缩计量认图片/thinking + 请求体拆解诊断
+
+### 背景
+排查「对话始终高于触发线、每轮空转压缩」时,发现 `_count_chars` 只统计
+`text / tool_use.input / tool_result 文本`,完全不计图片与 thinking 块,
+导致压缩切点/触发判断对这部分内容失明。
+
+进一步用真实会话核算后纠正了一个判断:**图片虽然 base64 字符极多,但单图 token
+有上限(约 1600),真实 token 占比远小于字符占比**——实测 80 张图也仅折算约
+8000 token。真正的「隐藏大头」是 `system + tools`(大量 MCP + skill 的工具定义,
+量级可达上百 K token),而它们不在 `messages` 里,`_count_chars` 结构上看不到。
+
+### 变更
+- `compressor._count_chars`:新增 `thinking`、`image`(顶层及 tool_result 内)的
+  统计。图片按 `_image_chars` 估算:`min(1600, base64长度//1000)` token × 4 换算成
+  字符当量(无图片尺寸,只能据 base64 长度粗估,封顶对齐 Anthropic 单图量级上限)。
+- `server._handle_messages`:新增**只读**的请求体拆解诊断日志 `[MSG] breakdown:`,
+  打印 `body / system / tools(数量) / 消息字符 / 图片数 / 估算 token`,
+  用于定位真实 token 分布(图片 vs system+tools),为后续修 keep_ratio 提供实测依据。
+
+### 影响
+- 计量更接近真实 token,日志 `chars=` 数值会因计入图片而变大(更诚实)。
+- breakdown 诊断不改变任何转发/压缩行为。
+- 需重启代理生效。
+
+### 待办(待 breakdown 实测后再做)
+- `keep_ratio = target_tokens / real_token_count` 的分母含 system+tools,却只对
+  messages 切割,单位不一致。待实测 system+tools 量级后,改为按「消息 token 预算」
+  (`target - system - tools`)计算,或在 system+tools 已超 target 时跳过无效压缩。
+
 ## 1.7.11 — 会话级日志(多会话排障)
 
 ### 背景
