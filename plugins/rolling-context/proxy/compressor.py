@@ -220,6 +220,59 @@ class RollingCompressor:
                     return True
         return False
 
+    def _select_cut(self, messages: list, keep_ratio: float) -> tuple:
+        """选择压缩切点,返回 (start_idx, keep_from_idx, prefix_len)。
+
+        prefix_len 既是注入前缀的消息数,也标示模式:
+          2 = clean 模式,前缀 [summary, ack],保留段以「干净 user 输入」开头;
+          1 = toolpair 模式,前缀 [summary],保留段以「assistant 新一轮」开头(agentic 突发期用);
+          0 = 直通,无可压旧消息。
+
+        约束:注入后 [前缀]+保留段须合法——角色交替、tool_result 紧跟其 tool_use、不留孤儿。
+          - clean:summary(user)→ack(assistant)→user(...) 合法;recent 开头是干净 user,无 tool_result
+            指向被摘要掉的 tool_use,故无孤儿。压得最深,优先。
+          - toolpair:突发期每个 user 都带 tool_result(其 tool_use 在前一条会被摘要的 assistant 里),
+            根本没有干净 user 边界。改在「assistant 开启的新一轮」前切:summary(user)→assistant(tool_use)
+            →user(tool_result) 角色合法、工具对都在保留段内、无孤儿;前缀去掉 ack(否则 summary,ack,
+            assistant 连续两个 assistant→上游 400)。
+        """
+        keep_from_idx = self._find_keep_index(messages, keep_ratio)
+        has_existing_summary = self._has_summary(messages)
+        start_idx = 2 if has_existing_summary else 0
+
+        # 单次向前扫描:优先取干净 user 边界;扫不到(突发一路到尾)再用沿途第一个 tool 对边界
+        # (assistant 且前一条是 user)。两类边界在同一索引互斥(角色不同),取最靠前者=保留段最长。
+        clean_idx = None
+        toolpair_idx = None
+        i = keep_from_idx
+        while i < len(messages):
+            m = messages[i]
+            if m.get("role") == "user" and not self._has_tool_result(m):
+                clean_idx = i
+                break
+            if (toolpair_idx is None and m.get("role") == "assistant"
+                    and i > 0 and messages[i - 1].get("role") == "user"):
+                toolpair_idx = i
+            i += 1
+
+        if clean_idx is not None:
+            keep_from_idx, prefix_len = clean_idx, 2
+        elif toolpair_idx is not None and toolpair_idx > start_idx:
+            keep_from_idx, prefix_len = toolpair_idx, 1
+        else:
+            # 既无干净 user、又无可用 tool 对边界:向后回退到最近的干净 user 边界(1.7.13 行为),
+            # 让摘要至少推进到上一次人类输入处。
+            bwd = keep_from_idx - 1
+            while bwd > start_idx and (
+                messages[bwd].get("role") != "user" or self._has_tool_result(messages[bwd])
+            ):
+                bwd -= 1
+            keep_from_idx, prefix_len = bwd, 2
+
+        if keep_from_idx <= start_idx or keep_from_idx >= len(messages):
+            return start_idx, keep_from_idx, 0
+        return start_idx, keep_from_idx, prefix_len
+
     def _has_summary(self, messages: list) -> bool:
         if not messages:
             return False
@@ -275,7 +328,7 @@ class RollingCompressor:
             parts.append(f"**{role}**: {text}")
         return "\n\n".join(parts)
 
-    def compress(self, messages: list, auth_headers: dict, real_token_count: int = None) -> list:
+    def compress(self, messages: list, auth_headers: dict, real_token_count: int = None) -> tuple:
         """Compress messages using rolling summarization (synchronous)."""
         # Use real API token count to determine what fraction of content to keep
         if real_token_count and real_token_count > 0:
@@ -289,38 +342,11 @@ class RollingCompressor:
             keep_ratio = 0.5
             log.info(f"Keep ratio: {keep_ratio:.1%} (fallback, no real token count)")
 
-        keep_from_idx = self._find_keep_index(messages, keep_ratio)
-
-        has_existing_summary = self._has_summary(messages)
-        start_idx = 2 if has_existing_summary else 0
-
-        # 切点须落在干净 user 边界(role==user 且不含 tool_result):Claude Code 会在 messages 间插入
-        # 独立 role:system 消息,且工具轮的 user 消息携带 tool_result;保留段以这些开头时,注入后紧跟
-        # ack(assistant) 会违反「system 须跟 user 后 / 角色交替 / tool_result 须紧跟 tool_use」→ 上游 400。
-        # 先从切点向后找最近的干净边界。
-        fwd = keep_from_idx
-        while fwd < len(messages) and (
-            messages[fwd].get("role") != "user" or self._has_tool_result(messages[fwd])
-        ):
-            fwd += 1
-
-        if fwd < len(messages):
-            keep_from_idx = fwd
-        else:
-            # 向后越界:近端是一长串工具轮、没有人类新输入(agentic burst 期间所有 user 消息都带
-            # tool_result),无干净边界可切。原逻辑此时直通 → 摘要边界冻结、上下文随工具连跑无限增长
-            # (实测边界长期卡在某点,人一敲字才跳一次)。改为向前回退到「最近一个干净 user 边界」,
-            # 让摘要至少推进到上一次人类输入处:切点更靠前=多留逐字,但合法且能持续前移。
-            bwd = keep_from_idx - 1
-            while bwd > start_idx and (
-                messages[bwd].get("role") != "user" or self._has_tool_result(messages[bwd])
-            ):
-                bwd -= 1
-            keep_from_idx = bwd
-
-        if keep_from_idx <= start_idx or keep_from_idx >= len(messages):
+        start_idx, keep_from_idx, prefix_len = self._select_cut(messages, keep_ratio)
+        if prefix_len == 0:
             log.info("Not enough old messages to compress, passing through")
-            return messages
+            return messages, 0
+        has_existing_summary = start_idx == 2
 
         existing_summary = self._extract_summary(messages) if has_existing_summary else ""
         to_compress = messages[start_idx:keep_from_idx]
@@ -328,7 +354,7 @@ class RollingCompressor:
 
         if not to_compress:
             log.info("Nothing to compress")
-            return messages
+            return messages, 0
 
         conversation_text = self._messages_to_text(to_compress)
 
@@ -423,7 +449,13 @@ class RollingCompressor:
             ),
         }
 
-        compressed = [summary_message, ack_message] + recent_messages
+        # clean 模式:[summary, ack]+recent(recent 以 user 开头,需 ack 隔开 summary(user) 与它);
+        # toolpair 模式:[summary]+recent(recent 以 assistant 开头,summary(user)→assistant 已合法,
+        # 再插 ack 反而连续两个 assistant→上游 400),故去掉 ack。
+        if prefix_len == 2:
+            compressed = [summary_message, ack_message] + recent_messages
+        else:
+            compressed = [summary_message] + recent_messages
 
         original_chars = self._count_chars(messages)
         compressed_chars = self._count_chars(compressed)
@@ -448,4 +480,4 @@ class RollingCompressor:
                 f"(summary={summary_chars:,}, recent={recent_chars:,})"
             )
 
-        return compressed
+        return compressed, prefix_len

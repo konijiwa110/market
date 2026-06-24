@@ -1,5 +1,38 @@
 # ChangeLog
 
+## 1.7.14 — tool 对边界切点(根治 agentic 突发期压不动)
+
+### 背景
+1.7.13 在「近端无干净 user 边界」时向**后**回退到上一次人类输入处,缓解了边界冻结;但仍有
+遗留局限:在一段**没有任何人类插话的 agentic 长突发**里,start_idx 之后压根不存在干净 user
+边界(每个 user 都带 `tool_result`),向前扫到尾、向后又退回 start_idx → 仍然直通,体量在
+工具连跑期一路堆到 90K–260K+,只能等人敲字才压一次。
+
+根因是切点的「干净 user 边界」是个**充分但过强**的约束。真正的硬约束只有两条:注入后角色
+必须交替、`tool_result` 必须紧跟其 `tool_use`(不留孤儿,否则 `_validate_tool_pairs` 会把摘要
+连同孤儿消息一起丢弃 → 上下文丢失 / 上游 400)。干净 user 边界只是满足它的一种方式。
+
+### 变更
+- 新增 **tool 对边界**切法,把切点选择抽成 `compressor._select_cut`,返回 `(start_idx,
+  keep_from_idx, prefix_len)`:
+  - **clean 模式(prefix_len=2)**:命中干净 user 边界,前缀仍是 `[summary, ack]`。压得最深,
+    **优先**——已有正常路径行为完全不变(回归测试验证切点与 1.7.13 逐一致)。
+  - **toolpair 模式(prefix_len=1)**:突发期扫不到干净 user 时,改在「assistant 开启的新一轮」
+    前切(`role==assistant` 且前一条是 `user`)。此时 `summary(user)→assistant(tool_use)→
+    user(tool_result)` 角色合法、工具对都在保留段内、无孤儿;前缀**去掉 ack**(否则 `summary,
+    ack, assistant` 连续两个 assistant → 上游 400)。
+  - 两者都不可用时,回退到 1.7.13 的向后干净边界,再不行才直通。
+- `compress()` 返回值由 `list` 改为 `(compressed, prefix_len)`;直通返回 `(messages, 0)`。
+- `server._do_background_compression`:按 `prefix_len` 动态切前缀(去掉硬编码 `[:2]` / `-2`),
+  以 `prefix_len==0` 判直通。注入侧 `_validate_tool_pairs` / `_mark_cache_breakpoint`(支持
+  `tool_use` 块)无需改动。
+
+### 影响
+- agentic 突发期**无需等人类插话即可压缩**,长突发体量不再堆到 90K–260K+。
+- 间接缓解用户实测延迟:压住此前直通的大上下文 → 请求体变小、上传与大上下文首字延迟同时下降。
+- 纯压缩切点逻辑改动,不改转发行为。已用结构化测试覆盖突发/纯对话(零回归)/混合/边缘/
+  已有摘要五类场景,验证 toolpair 切点无孤儿、摘要存活、clean 模式切点与 1.7.13 一致。需重启代理生效。
+
 ## 1.7.13 — 修复摘要边界冻结(agentic 长跑下压缩空转)
 
 ### 背景(实测日志定位)

@@ -413,21 +413,20 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
     _set_sess(sess)
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
-        compressed = compressor.compress(messages, auth_headers, real_token_count=real_token_count)
-        # 直通(无可压的旧消息):compress 原样返回同一 list 对象。此时不要把「前 2 条原始消息」
-        # 误存为压缩条目——那会生成 key=2 的垃圾条目污染匹配。直接移除本 entry 后返回。
-        if compressed is messages:
+        compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real_token_count)
+        # prefix_len==0 即直通(无可压旧消息):不要把原始消息误存为压缩条目(会生成垃圾 key 污染
+        # 匹配)。直接移除本 entry 后返回。
+        if prefix_len == 0:
             log.info("[BG] Pass-through (nothing to compress), discarding entry")
             entry["pending"] = None
             store.remove(entry)
             return
-        # compressed = [summary, ack] + recent_verbatim
-        # Prefix = ONLY [summary, ack] — verbatim messages come from the
-        # original request during injection, so including them in the prefix
-        # would cause duplication.
-        prefix = compressed[:2]
+        # compressed = [前缀] + recent_verbatim。前缀长度由模式决定:
+        #   clean 模式 prefix_len=2([summary, ack]);toolpair 模式 prefix_len=1([summary])。
+        # Prefix = ONLY 摘要前缀 — 逐字保留段注入时取自原始请求,放进前缀会重复。
+        prefix = compressed[:prefix_len]
         # Key = the messages that were summarized away (not the verbatim ones).
-        recent_count = len(compressed) - 2  # subtract summary + ack
+        recent_count = len(compressed) - prefix_len
         summarized = messages[:len(messages) - recent_count]
         # Skip old summary prefix if present
         from compressor import SUMMARY_MARKER
