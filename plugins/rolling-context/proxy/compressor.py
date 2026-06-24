@@ -291,16 +291,32 @@ class RollingCompressor:
 
         keep_from_idx = self._find_keep_index(messages, keep_ratio)
 
-        # 切点须落在干净 user 边界：Claude Code 会在 messages 间插入独立 role:system 消息，
-        # 保留段以 system/assistant/孤立 tool_result 开头时，注入后紧跟 ack(assistant) 会违反
-        # 「system 须跟 user 后 / 角色需交替」→ 上游 400。推进到下一个干净 user 边界。
-        while keep_from_idx < len(messages) and (
-            messages[keep_from_idx].get("role") != "user" or self._has_tool_result(messages[keep_from_idx])
-        ):
-            keep_from_idx += 1
-
         has_existing_summary = self._has_summary(messages)
         start_idx = 2 if has_existing_summary else 0
+
+        # 切点须落在干净 user 边界(role==user 且不含 tool_result):Claude Code 会在 messages 间插入
+        # 独立 role:system 消息,且工具轮的 user 消息携带 tool_result;保留段以这些开头时,注入后紧跟
+        # ack(assistant) 会违反「system 须跟 user 后 / 角色交替 / tool_result 须紧跟 tool_use」→ 上游 400。
+        # 先从切点向后找最近的干净边界。
+        fwd = keep_from_idx
+        while fwd < len(messages) and (
+            messages[fwd].get("role") != "user" or self._has_tool_result(messages[fwd])
+        ):
+            fwd += 1
+
+        if fwd < len(messages):
+            keep_from_idx = fwd
+        else:
+            # 向后越界:近端是一长串工具轮、没有人类新输入(agentic burst 期间所有 user 消息都带
+            # tool_result),无干净边界可切。原逻辑此时直通 → 摘要边界冻结、上下文随工具连跑无限增长
+            # (实测边界长期卡在某点,人一敲字才跳一次)。改为向前回退到「最近一个干净 user 边界」,
+            # 让摘要至少推进到上一次人类输入处:切点更靠前=多留逐字,但合法且能持续前移。
+            bwd = keep_from_idx - 1
+            while bwd > start_idx and (
+                messages[bwd].get("role") != "user" or self._has_tool_result(messages[bwd])
+            ):
+                bwd -= 1
+            keep_from_idx = bwd
 
         if keep_from_idx <= start_idx or keep_from_idx >= len(messages):
             log.info("Not enough old messages to compress, passing through")

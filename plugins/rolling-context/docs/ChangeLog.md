@@ -1,5 +1,39 @@
 # ChangeLog
 
+## 1.7.13 — 修复摘要边界冻结(agentic 长跑下压缩空转)
+
+### 背景(实测日志定位)
+读真实调试日志发现:压缩本身在工作(实测注入 1077 次、224K→77K 字符),但摘要边界
+长期**冻结**在某一点(日志里反复 `replaced 0-88`,而消息数从 160 涨到 181),注入后的
+体量随之从 77K 一路爬到 96K——「滚动」不前移,长会话仍会逼近上限。
+
+根因在 `compress()` 的切点边界选择:`_find_keep_index` 按 keep_ratio 算出切点后,只**向后**
+找「干净 user 边界」(`role==user` 且不含 `tool_result`)。但 Claude Code 里凡回应工具调用的
+user 消息都带 `tool_result`,**只有人类亲手敲字才产生干净 user**。在 agentic 工具连跑期间,
+最近窗口全是 assistant/tool_use/tool_result,无干净边界,切点一路推到 `len(messages)` →
+触发 `keep_from_idx >= len` → 直通,摘要永远生成不出来。日志佐证:工具连跑期边界冻在 `0-88`,
+人一敲字立刻跳到 `0-177`,停说话又退回——完全由「近端有无人类输入」决定。
+
+附带:直通路径下 `_do_background_compression` 把「前 2 条原始消息」误存成压缩条目
+(日志里反复出现的 `28,779 chars / key=2 hashes / summarized 2 messages` 冻结条目),
+既无用又污染匹配。
+
+### 变更
+- `compressor.compress`:切点向后越界(近端无干净边界)时,改为**向前回退**到「最近一个
+  干净 user 边界」。摘要至少推进到上一次人类输入处,而非冻结;切点更靠前=多留逐字,但仍
+  落在合法边界(不破坏 system/角色交替/工具配对,不触发上游 400)。
+- `server._do_background_compression`:检测到直通(`compressed is messages`)即不存条目并
+  `store.remove(entry)`,消除 `key=2` 垃圾条目。
+
+### 影响
+- agentic 长跑中摘要边界可持续前移,长会话注入后体量不再单调爬升。
+- 纯压缩调度逻辑修正,不改转发行为。需重启代理生效。
+
+### 关于 keep_ratio 单位不一致(降级,不再单列待办)
+`keep_ratio = target / real_token_count`,分母含 system+tools,却只切消息字符。实测
+system+tools 合计 < 34K token(此前「约 150K」的猜测经上游回报 token 证伪),失真很小,
+暂不处理。
+
 ## 1.7.12 — 压缩计量认图片/thinking + 请求体拆解诊断
 
 ### 背景

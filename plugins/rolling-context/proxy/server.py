@@ -414,6 +414,13 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
         compressed = compressor.compress(messages, auth_headers, real_token_count=real_token_count)
+        # 直通(无可压的旧消息):compress 原样返回同一 list 对象。此时不要把「前 2 条原始消息」
+        # 误存为压缩条目——那会生成 key=2 的垃圾条目污染匹配。直接移除本 entry 后返回。
+        if compressed is messages:
+            log.info("[BG] Pass-through (nothing to compress), discarding entry")
+            entry["pending"] = None
+            store.remove(entry)
+            return
         # compressed = [summary, ack] + recent_verbatim
         # Prefix = ONLY [summary, ack] — verbatim messages come from the
         # original request during injection, so including them in the prefix
