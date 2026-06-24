@@ -8,7 +8,20 @@ PIDFILE="$HOME/.claude/rolling-context-proxy.pid"
 VERFILE="$HOME/.claude/rolling-context-proxy.version"
 HOOKLOG="$HOME/.claude/rolling-context-hook.log"
 CONFIG_FILE="$HOME/.claude/rolling-context.json"
-_py() { if command -v python3 &>/dev/null; then python3 "$@"; else python "$@"; fi; }
+# Detect Windows (git bash) — 必须在选 python 之前:Windows 的 python3 常是
+# 微软商店空壳(command -v 命中但无输出),会让端口探测拿到空串。
+if [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]]; then
+    IS_WINDOWS=true
+else
+    IS_WINDOWS=false
+fi
+if [ "$IS_WINDOWS" = true ]; then
+    _py() { python "$@"; }
+elif command -v python3 &>/dev/null; then
+    _py() { python3 "$@"; }
+else
+    _py() { python "$@"; }
+fi
 # 端口取自 rolling-context.json > 环境变量 > 5588。
 PORT=$(_py - "$CONFIG_FILE" <<'PYEOF'
 import json, sys, os
@@ -19,19 +32,14 @@ except Exception:
 print(c.get("port") or os.environ.get("ROLLING_CONTEXT_PORT") or 5588)
 PYEOF
 )
+# 兜底:任何原因导致 PORT 为空(python 缺失/异常)都不能让 URL 丢端口。
+[ -z "$PORT" ] && PORT=5588
 PROXY_URL="http://127.0.0.1:$PORT"
 CURRENT_VERSION=$(cat "$SCRIPT_DIR/../.claude-plugin/plugin.json" 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HOOKLOG"
 }
-
-# Detect Windows (git bash)
-if [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]]; then
-    IS_WINDOWS=true
-else
-    IS_WINDOWS=false
-fi
 
 log "Hook started. PROXY_DIR=$PROXY_DIR IS_WINDOWS=$IS_WINDOWS"
 
