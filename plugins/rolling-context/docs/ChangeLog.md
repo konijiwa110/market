@@ -1,5 +1,17 @@
 # ChangeLog
 
+## 1.7.16 — 默认 trigger 100K → 160K
+
+### 变更
+默认压缩触发阈值 `trigger` 从 `100000` tokens 提升到 `160000`。新装/无 config 无 env 的环境受影响;
+已有 `rolling-context.json` 或 settings.json env 显式指定 `trigger` 的环境不变。
+
+### 动机
+100K 触发偏激进,会话刚到中等体量就压缩,牺牲了一段本可保留的近期上下文;且压缩本身有成本(一次
+Haiku 摘要调用 + 后台延迟)。160K 在「离 Claude Code 自身上下文上限仍有充裕余量」与「少压一次、
+多留上下文」之间更平衡。同步改动:`server.py` 默认值、两个 hook(`.ps1`/`.sh`)写入 settings.json
+的 env 默认、`README.md`、`rolling-context.example.json`。
+
 ## 1.7.15 — 分块摘要(根治 giant 会话 400 prompt too long)+ .ps1 端口去重兜底
 
 ### 背景

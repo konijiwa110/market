@@ -63,7 +63,7 @@ try {
         # 仅无 config 时写 env 默认（有 config 时由 server.py 从 config 读，不污染 settings.json）。
         $defaults = @{
             "ROLLING_CONTEXT_PORT"    = "5588"
-            "ROLLING_CONTEXT_TRIGGER" = "100000"
+            "ROLLING_CONTEXT_TRIGGER" = "160000"
             "ROLLING_CONTEXT_TARGET"  = "40000"
             "ROLLING_CONTEXT_MODEL"   = "claude-haiku-4-5-20251001"
         }

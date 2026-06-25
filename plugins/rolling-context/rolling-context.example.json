@@ -1,6 +1,6 @@
 {
   "_comment": "复制到 ~/.claude/rolling-context.json。每项都是 config 优先、环境兜底：写了就用、没写就从环境读。默认不要写 upstream 和 apikey —— 它们跟随环境（settings.json 的 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN），切换环境/账号自动跟随；只有想钉死到某个第三方端点时才显式加 \"upstream\": \"https://...\" 和/或 \"apikey\": \"...\"。这里只放与环境无关的压缩偏好。",
-  "trigger": 100000,
+  "trigger": 160000,
   "target": 40000,
   "model": "claude-haiku-4-5-20251001"
 }

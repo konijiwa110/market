@@ -132,7 +132,7 @@ def _load_upstream() -> str:
 
 
 UPSTREAM_URL = _load_upstream()
-TRIGGER_TOKENS = int(_cfg("trigger", "ROLLING_CONTEXT_TRIGGER", 100000))
+TRIGGER_TOKENS = int(_cfg("trigger", "ROLLING_CONTEXT_TRIGGER", 160000))
 TARGET_TOKENS = int(_cfg("target", "ROLLING_CONTEXT_TARGET", 40000))
 SUMMARIZER_MODEL = _cfg("model", "ROLLING_CONTEXT_MODEL", "claude-haiku-4-5-20251001")
 # 鉴权：config 显式给了才用，否则透传 claude 发来的 ANTHROPIC_AUTH_TOKEN（默认不写）。

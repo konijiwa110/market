@@ -50,7 +50,7 @@ Drop a `~/.claude/rolling-context.json` to override defaults. Every key is **con
 |------|------------|----------------------|
 | Upstream baseURL | `upstream` | `ROLLING_CONTEXT_UPSTREAM` → `settings.json` `ANTHROPIC_BASE_URL` (auto-chain) |
 | Auth key | `apikey` | `ROLLING_CONTEXT_APIKEY` → Claude Code's passed-through `ANTHROPIC_AUTH_TOKEN` |
-| Trigger tokens | `trigger` | `ROLLING_CONTEXT_TRIGGER` (default `100000`) |
+| Trigger tokens | `trigger` | `ROLLING_CONTEXT_TRIGGER` (default `160000`) |
 | Target tokens kept | `target` | `ROLLING_CONTEXT_TARGET` (default `40000`) |
 | Summarizer model | `model` | `ROLLING_CONTEXT_MODEL` (default `claude-haiku-4-5-20251001`) |
 | Listen port | `port` | `ROLLING_CONTEXT_PORT` (default `5588`) |
@@ -59,7 +59,7 @@ Drop a `~/.claude/rolling-context.json` to override defaults. Every key is **con
 
 ```json
 {
-  "trigger": 100000,
+  "trigger": 160000,
   "target": 40000,
   "model": "claude-haiku-4-5-20251001"
 }
