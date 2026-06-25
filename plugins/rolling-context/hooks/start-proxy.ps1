@@ -103,6 +103,25 @@ if (Test-Path $PidFile) {
     Remove-Item $VerFile -Force -ErrorAction SilentlyContinue
 }
 
+# 兜底去重:无论 PidFile 是否准确,起新代理前先清掉任何仍在监听本端口的残留进程,
+# 根治「PidFile 被污染(如手动跑过 .sh 记成包装层 PID)→ 旧代理没杀掉 + 起新的 → 双实例抢端口」。
+# 注:同版本健康代理已在上面的 PidFile 检查里 exit 0,走不到这里,不会误杀健康实例。
+try {
+    $listeners = Get-NetTCPConnection -State Listen -LocalPort ([int]$Port) -ErrorAction SilentlyContinue
+    $killed = $false
+    foreach ($conn in $listeners) {
+        $opid = $conn.OwningProcess
+        if ($opid -and $opid -ne 0) {
+            Log "Killing stale listener on port $Port (PID $opid)"
+            Stop-Process -Id $opid -Force -ErrorAction SilentlyContinue
+            $killed = $true
+        }
+    }
+    if ($killed) { Start-Sleep -Milliseconds 500 }
+} catch {
+    Log "Port cleanup skipped: $_"
+}
+
 # Start proxy directly with system python — no venv needed
 Log "Starting proxy..."
 $proc = Start-Process -FilePath "python" -ArgumentList "server.py" `

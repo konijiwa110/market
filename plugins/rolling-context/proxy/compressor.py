@@ -70,6 +70,12 @@ def _join_path(upstream_path: str, request_path: str) -> str:
 SUMMARY_MARKER = "[ROLLING_CONTEXT_SUMMARY]"
 SUMMARY_END_MARKER = "[/ROLLING_CONTEXT_SUMMARY]"
 
+# 单次摘要调用喂给摘要器的「会话正文」字符上限。摘要器是 200K 上下文的 Haiku;留出输出(16K tok)、
+# 既有滚动摘要(≤16K tok)与模板的余量后,会话正文控制在 ~450K 字符(~120–150K tok)以内。
+# to_compress 文本超过此值即分块:逐块把上一块的摘要作为 existing_summary 续摘,避免一次塞爆 →
+# 上游 400 "prompt is too long > 200000"(1.7.14 实测 giant 会话的主要失败模式)。
+SUMMARIZER_INPUT_CHAR_BUDGET = int(os.environ.get("ROLLING_CONTEXT_SUMMARIZER_CHAR_BUDGET") or 450_000)
+
 SUMMARIZE_PROMPT = """You are a context compressor for an AI coding assistant conversation.
 
 Your job: take the conversation below and produce a CHRONOLOGICAL, DENSE technical summary.
@@ -328,36 +334,25 @@ class RollingCompressor:
             parts.append(f"**{role}**: {text}")
         return "\n\n".join(parts)
 
-    def compress(self, messages: list, auth_headers: dict, real_token_count: int = None) -> tuple:
-        """Compress messages using rolling summarization (synchronous)."""
-        # Use real API token count to determine what fraction of content to keep
-        if real_token_count and real_token_count > 0:
-            keep_ratio = self.target_tokens / real_token_count
-            log.info(
-                f"Keep ratio: {keep_ratio:.1%} "
-                f"(target={self.target_tokens:,} / real={real_token_count:,})"
-            )
-        else:
-            # Fallback: keep half (conservative)
-            keep_ratio = 0.5
-            log.info(f"Keep ratio: {keep_ratio:.1%} (fallback, no real token count)")
+    def _chunk_by_chars(self, messages: list, char_budget: int) -> list:
+        """把消息按时间序贪心切成多块,每块 _messages_to_text 长度 ≤ char_budget。
+        单条消息在 _messages_to_text 里已截到 ~4KB,不会单独超预算,故贪心累加即可。"""
+        chunks = []
+        cur, cur_chars = [], 0
+        for m in messages:
+            mc = len(self._messages_to_text([m]))
+            if cur and cur_chars + mc > char_budget:
+                chunks.append(cur)
+                cur, cur_chars = [], 0
+            cur.append(m)
+            cur_chars += mc
+        if cur:
+            chunks.append(cur)
+        return chunks
 
-        start_idx, keep_from_idx, prefix_len = self._select_cut(messages, keep_ratio)
-        if prefix_len == 0:
-            log.info("Not enough old messages to compress, passing through")
-            return messages, 0
-        has_existing_summary = start_idx == 2
-
-        existing_summary = self._extract_summary(messages) if has_existing_summary else ""
-        to_compress = messages[start_idx:keep_from_idx]
-        recent_messages = messages[keep_from_idx:]
-
-        if not to_compress:
-            log.info("Nothing to compress")
-            return messages, 0
-
-        conversation_text = self._messages_to_text(to_compress)
-
+    def _summarize_chunk(self, conversation_text: str, existing_summary: str, auth_headers: dict) -> str:
+        """单次摘要调用:把 conversation_text(整段或分块中的一块)连同 existing_summary 一起送摘要器,
+        返回新的滚动摘要文本。非 200 抛 RuntimeError。"""
         summary_max_tokens = 16000
 
         existing_section = ""
@@ -372,11 +367,6 @@ class RollingCompressor:
         prompt = SUMMARIZE_PROMPT.format(
             existing_summary_section=existing_section,
             conversation=conversation_text,
-        )
-
-        log.info(
-            f"Summarizing {len(to_compress)} messages ({len(conversation_text):,} chars) "
-            f"with {self.summarizer_model} (max_tokens={summary_max_tokens:,})..."
         )
 
         cc_user_id = json.dumps({
@@ -406,7 +396,6 @@ class RollingCompressor:
         headers["accept-encoding"] = "identity"
 
         summarizer_path = _join_path(self._summ_path, "/v1/messages")
-        log.info(f"Compression request -> {self.summarizer_url} path={summarizer_path}")
 
         conn = self._conn()
         conn.request("POST", summarizer_path, body=req_body, headers=headers)
@@ -425,8 +414,65 @@ class RollingCompressor:
             error = resp_body.decode("utf-8", errors="replace")
             raise RuntimeError(f"Summarization API returned {resp.status}: {error[:500]}")
         data = json.loads(resp_body)
+        return data["content"][0]["text"]
 
-        new_summary = data["content"][0]["text"]
+    def compress(self, messages: list, auth_headers: dict, real_token_count: int = None) -> tuple:
+        """Compress messages using rolling summarization (synchronous)."""
+        # Use real API token count to determine what fraction of content to keep
+        if real_token_count and real_token_count > 0:
+            keep_ratio = self.target_tokens / real_token_count
+            log.info(
+                f"Keep ratio: {keep_ratio:.1%} "
+                f"(target={self.target_tokens:,} / real={real_token_count:,})"
+            )
+        else:
+            # Fallback: keep half (conservative)
+            keep_ratio = 0.5
+            log.info(f"Keep ratio: {keep_ratio:.1%} (fallback, no real token count)")
+
+        start_idx, keep_from_idx, prefix_len = self._select_cut(messages, keep_ratio)
+        if prefix_len == 0:
+            log.info("Not enough old messages to compress, passing through")
+            return messages, 0
+        has_existing_summary = start_idx == 2
+
+        existing_summary = self._extract_summary(messages) if has_existing_summary else ""
+        to_compress = messages[start_idx:keep_from_idx]
+        recent_messages = messages[keep_from_idx:]
+
+        if not to_compress:
+            log.info("Nothing to compress")
+            return messages, 0
+
+        conversation_text = self._messages_to_text(to_compress)
+        log.info(f"Compression request -> {self.summarizer_url}")
+
+        if len(conversation_text) <= SUMMARIZER_INPUT_CHAR_BUDGET:
+            # 常见路径:整段一次摘要,行为与 1.7.14 一致。
+            log.info(
+                f"Summarizing {len(to_compress)} messages ({len(conversation_text):,} chars) "
+                f"with {self.summarizer_model}..."
+            )
+            new_summary = self._summarize_chunk(conversation_text, existing_summary, auth_headers)
+        else:
+            # giant 会话:to_compress 文本超摘要器窗口,按时序分块,逐块把上一块摘要作为
+            # existing_summary 续摘,得到一份整合的滚动摘要——避免一次塞爆 → 400 prompt too long。
+            chunks = self._chunk_by_chars(to_compress, SUMMARIZER_INPUT_CHAR_BUDGET)
+            log.info(
+                f"Summarizing {len(to_compress)} messages ({len(conversation_text):,} chars) "
+                f"in {len(chunks)} chunks (> {SUMMARIZER_INPUT_CHAR_BUDGET:,} char budget) "
+                f"with {self.summarizer_model}..."
+            )
+            rolling = existing_summary
+            for ci, chunk in enumerate(chunks, 1):
+                chunk_text = self._messages_to_text(chunk)
+                rolling = self._summarize_chunk(chunk_text, rolling, auth_headers)
+                log.info(
+                    f"  chunk {ci}/{len(chunks)}: {len(chunk)} msgs "
+                    f"({len(chunk_text):,} chars) -> rolling summary {len(rolling):,} chars"
+                )
+            new_summary = rolling
+
         log.info(f"Summary generated: {len(new_summary):,} chars")
 
         summary_message = {

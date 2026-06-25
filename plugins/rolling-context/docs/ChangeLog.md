@@ -1,5 +1,39 @@
 # ChangeLog
 
+## 1.7.15 — 分块摘要(根治 giant 会话 400 prompt too long)+ .ps1 端口去重兜底
+
+### 背景
+1.7.14 消灭了「无干净边界放行」,中等会话能稳定压缩;但 giant 会话(`to_compress` 文本超摘要器
+窗口,实测 6.6MB / 1879 messages 的会话)会把整段一次性塞进摘要 prompt → 上游返
+`400 prompt too long > 200K` → 压缩硬失败 → 体量继续堆、最终打网关 502。根因是摘要输入**未限总量**。
+
+另:排障时发现一处长期误判——Windows 上 CC 实际走 `start-proxy.ps1`(`.sh` 仅 powershell 不可用
+时兜底)。`.ps1` 用 `Start-Process -PassThru`,`.Id` 即真正的 python PID、且已带
+`-RedirectStandardOutput/-RedirectStandardError`,故「PIDFILE 记错」「SessionStart 挂死」在真实
+路径本就不存在;之前的现象是**手动跑过 `.sh`(nohup,`$!` 取到包装层 PID)污染了 PidFile** 所致。
+
+### 变更
+- **分块摘要**(`compressor.compress`):
+  - 新增预算 `SUMMARIZER_INPUT_CHAR_BUDGET`(默认 450K 字符 ≈ 112K token,环境变量
+    `ROLLING_CONTEXT_SUMMARIZER_CHAR_BUDGET` 可覆盖)。
+  - `to_compress` 文本 **≤ 预算**:整段一次摘要,**行为与 1.7.14 完全一致**(零回归)。
+  - **> 预算**:`_chunk_by_chars` 按时间序贪心切块(**单条消息不拆**,保证内容完整),逐块调用
+    `_summarize_chunk`,把**上一块的摘要作为下一块的 `existing_summary` 续摘** → 得到一份整合的
+    滚动摘要,绝不会一次塞爆窗口。`recent_messages` 始终原样保留在摘要之后。
+  - 摘要单次调用抽成 `_summarize_chunk(conversation_text, existing_summary, auth_headers)`。
+- **`.ps1` 端口去重兜底**:起新代理前(PidFile 清理后、`Start-Process` 前)用
+  `Get-NetTCPConnection -LocalPort $Port` 找到仍监听本端口的进程并 `Stop-Process`,根治
+  「PidFile 被污染 → 旧代理没杀掉 + 起新的 → 双实例抢端口」。同版本健康代理在前面 `exit 0`,
+  走不到这里,不会误杀。
+
+### 影响
+- giant 会话不再因 400 硬失败,可分块压下;严格优于此前「直接失败 + 502」。
+- 代价:giant 会话触发**多次串行摘要调用**(如 6.6MB ≈ 15 块),压缩耗时拉长;任一块返非 200
+  会整体抛错重来。常见(≤预算)会话路径不受影响。
+- 版本升级时不再因 PidFile 污染产生双实例。需重启代理生效。
+- 已用结构化测试覆盖:分块切分无丢失、超预算多块串联(首块 existing 空、后续串上一块摘要)、
+  预算内恰好单次调用(单次路径零回归)。
+
 ## 1.7.14 — tool 对边界切点(根治 agentic 突发期压不动)
 
 ### 背景
