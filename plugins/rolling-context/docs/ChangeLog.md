@@ -1,5 +1,25 @@
 # ChangeLog
 
+## 1.7.19 — 真正修掉 Windows hook 报 `<盘符>:\dev\null`(1.7.17 修漏了)
+
+### 背景
+1.7.17 自以为修好了 SessionStart hook 报 `C:\dev\null`,只删了 powershell 分支后的
+`2>/dev/null`，**保留了结尾 bash 分支的那个**，并断言「Windows 因 `||` 短路仅解析不执行、
+不触发 Out-File」。该断言是错的。最小复现:
+- `powershell -Command "exit 0" || bash -c "true" 2>/dev/null` —— powershell **成功**时短路,**不报错**;
+- `powershell -Command "exit 1" || bash -c "true" 2>/dev/null` —— powershell **失败**时走到 bash 分支,
+  pwsh 真正处理 `2>/dev/null` → `Out-File '<盘符>:\dev\null'` → 目录不存在报错(在 D 盘即 `D:\dev\null`)。
+
+即只要 powershell 分支某次返回非零(如 compact 触发的 SessionStart 执行环境里 `powershell` 不在
+PATH、或 .ps1 非零退出),fallback 的这个重定向就炸。
+
+### 变更
+`hooks/hooks.json`:删除结尾 bash 分支的 `2>/dev/null`，命令变为
+`powershell ...start-proxy.ps1 || bash ...start-proxy.sh`。对 pwsh 全程安全(无任何 `/dev/null`)。
+代价:Mac/Linux 下 `start-proxy.sh` 自身 stderr 不再被该重定向吞掉——但 `.sh` 本就把日志写进
+`~/.claude/rolling-context-hook.log`、内部子命令各自带 `2>/dev/null`,实际噪声可忽略;且 `powershell
+not found` 那行噪声本就不受该重定向控制(它只作用于 bash 命令),故无新增回归。
+
 ## 1.7.18 — 摘要逐字保留用户提供的密钥/密码
 
 ### 背景

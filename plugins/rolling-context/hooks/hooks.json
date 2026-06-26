@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/start-proxy.ps1\" || bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start-proxy.sh\" 2>/dev/null",
+            "command": "powershell -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/start-proxy.ps1\" || bash \"${CLAUDE_PLUGIN_ROOT}/hooks/start-proxy.sh\"",
             "timeout": 30
           }
         ]
