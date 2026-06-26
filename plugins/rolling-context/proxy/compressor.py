@@ -89,6 +89,7 @@ RULES:
 - Preserve ALL user requests and instructions — what they asked for, what constraints they gave, what they said to do or NOT do
 - Preserve user preferences, workflow choices, and recurring patterns (e.g. "always use X", "never do Y")
 - Preserve VERBATIM any secrets/credentials the user supplied: API keys, tokens, passwords, connection strings, env-var values, account/project IDs. Copy the EXACT characters — never mask, truncate, paraphrase, or replace with "<redacted>"/"***". These cannot be reconstructed if lost, and dropping them forces the user to re-enter them.
+- For each such credential, ALSO keep its binding context: WHO/WHAT it is for (service, account, host, or URL it authenticates to) and WHERE it is used (the exact env-var name, config file, command, or step it goes into). A bare value with no context is nearly useless — value and context must travel together.
 - Include key code snippets when they're central to understanding (keep them short)
 - Do NOT editorialize or add commentary
 - Be as DENSE as possible — every sentence should carry information
@@ -113,7 +114,7 @@ FORMAT:
 - [File paths, configs, decisions that must not be forgotten]
 
 ## Secrets & Credentials (verbatim)
-- [Any API keys, tokens, passwords, connection strings, or env-var values the user provided, copied EXACTLY character-for-character. Label each by purpose, e.g. "OpenAI API key = sk-...". Omit this whole section ONLY if the user supplied none.]
+- [For EACH secret the user provided, one line: what it is for (service/account/host/URL it authenticates to) — where it is used (exact env-var name, config file, command, or step) = the EXACT value, character-for-character. e.g. "OpenAI API (chat completions) — env OPENAI_API_KEY in .env = sk-abc123...". Omit this whole section ONLY if the user supplied none.]
 
 {existing_summary_section}
 
