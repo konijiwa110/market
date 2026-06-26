@@ -1,5 +1,19 @@
 # ChangeLog
 
+## 1.7.17 — 修复 Windows SessionStart hook 报 `C:\dev\null`
+
+### 背景
+Windows 上每次会话启动报 non-blocking 错误:`Out-File: Could not find a part of the path 'C:\dev\null'`。
+根因是 SessionStart hook 命令按 bash 写法在 powershell 分支尾部带了 `2>/dev/null`;Windows 下 CC 用
+pwsh 执行该命令,`2>/dev/null` 被解析为「把 stderr 写到文件 `/dev/null`」,而 pwsh 把 `/dev/null`
+当成当前盘根下的 `C:\dev\null`,目录不存在 → Out-File 报错。代理实际照常起,只是噪声报错。
+
+### 变更
+- `hooks/hooks.json`:删除 powershell 分支后的 `2>/dev/null`。`.ps1` 本身已全程静音
+  (`$ErrorActionPreference = "SilentlyContinue"` + 只写日志文件),该重定向在 Windows 上纯属害处。
+  bash 分支的 `2>/dev/null` 保留——它只在 Mac/Linux(sh)真正执行,Windows 因 `||` 短路仅被解析不执行,
+  不会触发 Out-File。
+
 ## 1.7.16 — 默认 trigger 100K → 160K
 
 ### 变更
