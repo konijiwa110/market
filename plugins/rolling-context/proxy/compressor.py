@@ -88,6 +88,7 @@ RULES:
 - Preserve ALL errors encountered and how they were resolved
 - Preserve ALL user requests and instructions — what they asked for, what constraints they gave, what they said to do or NOT do
 - Preserve user preferences, workflow choices, and recurring patterns (e.g. "always use X", "never do Y")
+- Preserve VERBATIM any secrets/credentials the user supplied: API keys, tokens, passwords, connection strings, env-var values, account/project IDs. Copy the EXACT characters — never mask, truncate, paraphrase, or replace with "<redacted>"/"***". These cannot be reconstructed if lost, and dropping them forces the user to re-enter them.
 - Include key code snippets when they're central to understanding (keep them short)
 - Do NOT editorialize or add commentary
 - Be as DENSE as possible — every sentence should carry information
@@ -110,6 +111,9 @@ FORMAT:
 
 ## Key Details
 - [File paths, configs, decisions that must not be forgotten]
+
+## Secrets & Credentials (verbatim)
+- [Any API keys, tokens, passwords, connection strings, or env-var values the user provided, copied EXACTLY character-for-character. Label each by purpose, e.g. "OpenAI API key = sk-...". Omit this whole section ONLY if the user supplied none.]
 
 {existing_summary_section}
 
