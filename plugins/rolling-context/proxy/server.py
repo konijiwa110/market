@@ -25,7 +25,7 @@ import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-from compressor import RollingCompressor
+from compressor import RollingCompressor, SUMMARY_MARKER
 from stats import StatsCollector
 
 class FlushFileHandler(logging.handlers.RotatingFileHandler):
@@ -172,6 +172,10 @@ TARGET_TOKENS = int(_cfg("target", "ROLLING_CONTEXT_TARGET", 40000))
 SUMMARIZER_MODEL = _cfg("model", "ROLLING_CONTEXT_MODEL", "claude-haiku-4-5-20251001")
 # 鉴权：config 显式给了才用，否则透传 claude 发来的 ANTHROPIC_AUTH_TOKEN（默认不写）。
 APIKEY = _cfg("apikey", "ROLLING_CONTEXT_APIKEY", "")
+# 永不超发兜底:未命中缓存时若上游以「prompt too long」拒绝超限请求,就同步压一次并重试一发,
+# CC 端永不看到这发 400(也让 CC 自己的 autoCompact/`/compact` 那发超限摘要请求被压住、得以成功,
+# 把真实 transcript 焊小 → 停插件后也不再全量重跑)。默认开;设 0/false/off 关闭回到旧的裸发行为。
+EMERGENCY_COMPRESS = str(_cfg("emergency_compress", "ROLLING_CONTEXT_EMERGENCY_COMPRESS", "1")).lower() not in ("0", "false", "off", "no")
 
 ssl_ctx = ssl.create_default_context()
 _parsed_upstream = urlparse(UPSTREAM_URL)
@@ -273,6 +277,69 @@ def _hash_message(msg: dict) -> str:
 
 def _hash_messages(messages: list) -> list:
     return [_hash_message(m) for m in messages]
+
+
+# ---------------------------------------------------------------------------
+# 永不超发:同步压缩兜底的判定 / 解析 / 复用辅助
+# ---------------------------------------------------------------------------
+
+def _looks_too_long(body: bytes) -> bool:
+    """上游 400 响应体是否为「提示词超过上下文上限」类错误(如 'prompt is too long: N tokens >
+    1000000 maximum')。只认这一类才触发同步压缩重试,其它 400(鉴权/格式)原样回给 CC。"""
+    try:
+        s = body.decode("utf-8", "replace").lower()
+    except Exception:
+        return False
+    if "too long" in s:
+        return True
+    return ("maximum" in s and "token" in s)
+
+
+_REPORTED_TOK_RE = re.compile(r"(\d[\d,]{3,})\s*tokens?", re.I)
+
+
+def _parse_reported_tokens(body: bytes):
+    """从超限错误体里解析出「这次提示词的真实 token 数」(错误串里 'tokens' 前的第一个大数,
+    如 2100398),用作压缩 keep 比例的分母 → 一次就压到上限内。解析不到返回 None。"""
+    try:
+        s = body.decode("utf-8", "replace")
+    except Exception:
+        return None
+    m = _REPORTED_TOK_RE.search(s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _compression_key_hashes(source_messages: list, compressed: list, prefix_len: int):
+    """由「压缩前的源消息」与「压缩结果」反推被摘要掉那段的 hash 链(匹配 key)。
+    返回 (key_hashes, summarized_slice)。后台压缩与同步兜底共用,保证两条路径产出的 key 一致。"""
+    recent_count = len(compressed) - prefix_len
+    summarized = source_messages[:len(source_messages) - recent_count]
+    start = 0
+    if summarized and isinstance(summarized[0].get("content", ""), str):
+        if SUMMARY_MARKER in summarized[0]["content"]:
+            start = 2
+    return _hash_messages(summarized[start:]), summarized[start:]
+
+
+def _remark_cache_breakpoints(msgs: list):
+    """先删净所有 cache_control(注入/重组后旧断点位置失效、且可能超 4 个上限),再在两个稳定边界
+    各打一个 ephemeral:前缀末尾(摘要+ack,跨轮稳定)与末条消息(近端尾巴 5min 窗口内 cache_read)。
+    断点总数 = system + tools + 2 ≤ 4,不触发上游 400。注入路径与同步兜底共用。"""
+    for m in msgs:
+        c = m.get("content", "")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict):
+                    b.pop("cache_control", None)
+    if len(msgs) >= 2:
+        _mark_cache_breakpoint(msgs[1])
+    if msgs:
+        _mark_cache_breakpoint(msgs[-1])
 
 
 class CompressionStore:
@@ -541,27 +608,46 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
         # Prefix = ONLY 摘要前缀 — 逐字保留段注入时取自原始请求,放进前缀会重复。
         prefix = compressed[:prefix_len]
         # Key = the messages that were summarized away (not the verbatim ones).
-        recent_count = len(compressed) - prefix_len
-        summarized = messages[:len(messages) - recent_count]
-        # Skip old summary prefix if present
-        from compressor import SUMMARY_MARKER
-        start = 0
-        if summarized and isinstance(summarized[0].get("content", ""), str):
-            if SUMMARY_MARKER in summarized[0]["content"]:
-                start = 2
-        key_hashes = _hash_messages(summarized[start:])
+        key_hashes, summarized = _compression_key_hashes(messages, compressed, prefix_len)
         entry["pending"] = prefix
         entry["pending_hashes"] = key_hashes
-        entry["_debug_messages"] = summarized[start:]  # for mismatch debugging
+        entry["_debug_messages"] = summarized  # for mismatch debugging
         log.info(
             f"[BG] Compression ready: "
             f"{compressor._count_chars(prefix):,} chars "
             f"({len(prefix)} prefix messages, key={len(key_hashes)} hashes, "
-            f"summarized {len(summarized) - start} messages)"
+            f"summarized {len(summarized)} messages)"
         )
     except Exception as e:
         log.error(f"[BG] Compression failed: {e}", exc_info=True)
         entry["pending"] = None
+
+
+def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg_chars: int):
+    """同步压缩兜底:上游以「prompt too long」拒了超限请求后,当场把旧消息摘掉、只留近端,返回可直接
+    发送的【完整新消息数组】。同时把这次压缩登记进 store(prefix + key 链),让后续请求直接命中、不必
+    再付这次的同步延迟。压不出可压旧消息时返回 None(交由调用方原样回 400)。
+
+    keep 比例的分母优先用错误体里上游自报的真实 token 数(最准,一次即压到上限内);解析不到再用
+    msg_chars/3 粗估兜底。"""
+    real = reported_tokens or (msg_chars // 3 if msg_chars else None)
+    compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real)
+    if prefix_len == 0:
+        log.warning("[EMG] Nothing to compress (prefix_len=0); cannot shrink request")
+        return None
+    key_hashes, summarized = _compression_key_hashes(messages, compressed, prefix_len)
+    entry = store.add()
+    entry["prefix"] = compressed[:prefix_len]
+    entry["original_hashes"] = key_hashes
+    entry["_debug_messages"] = summarized
+    entry["used"] = True          # 已当场用上,不再标「首次注入」
+    entry["pre_tokens"] = real or 0
+    log.info(
+        f"[EMG] Synchronous compression done: {len(messages)} -> {len(compressed)} messages "
+        f"({compressor._count_chars(compressed):,} chars, key={len(key_hashes)} hashes); "
+        f"registered for future matches"
+    )
+    return compressed
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -880,16 +966,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             #   1) 摘要前缀末尾(ack,merged[1]):promote 后不变 → 缓存 system+tools+summary+ack 这一大段
             #   2) 末条消息(merged[-1]):近端尾巴在 5min 窗口内跨轮 cache_read
             # 断点总数 = system + tools + 2 ≤ 4,不触发上游 400。
-            for msg in merged:
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            block.pop("cache_control", None)
-            if len(merged) >= 2:
-                _mark_cache_breakpoint(merged[1])
-            if merged:
-                _mark_cache_breakpoint(merged[-1])
+            _remark_cache_breakpoints(merged)
 
             merged_chars = compressor._count_chars(merged)
             if merged_chars < msg_chars:
@@ -934,6 +1011,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "concurrent": False, "stream_chunks": 0,
             "kind": "request",  # 与 compressor 回灌的 kind=="compression" 区分
             "first_compressed": first_compressed, "pre_tokens": pre_compress_tokens,
+            "emergency": False,  # 是否走了「超限→同步压缩重试」兜底
         }
         t_first = None
         t_fwd = t_recv
@@ -955,6 +1033,46 @@ class ProxyHandler(BaseHTTPRequestHandler):
             resp = conn.getresponse()
 
             log.info(f"[MSG] Upstream response: {resp.status} {resp.reason}")
+
+            # 永不超发兜底:未命中缓存时,若上游因「prompt too long」拒了这发超限请求,就当场同步压一次、
+            # 把结果换进请求体重试一发——CC 端永不看到这发 400。也让 CC 自己的 autoCompact/`/compact`
+            # 那发超限摘要请求得以成功,把真实 transcript 焊小。最多重试一发,压不动/仍失败则原样回 400。
+            prebuffered = None  # 非重试的 400:已读出的错误体,直接回给 CC(不再走流式读取)
+            if EMERGENCY_COMPRESS and not is_count and not injected and resp.status == 400:
+                err_preview = resp.read()  # 400 体很小
+                conn.close()
+                if _looks_too_long(err_preview):
+                    reported = _parse_reported_tokens(err_preview)
+                    log.warning(
+                        f"[MSG] Upstream 400 'too long' (reported={reported}); "
+                        f"compressing synchronously and retrying once"
+                    )
+                    new_msgs = None
+                    try:
+                        new_msgs = _emergency_compress(current_messages, auth_headers, reported, msg_chars)
+                    except Exception as ex:
+                        log.error(f"[MSG] Emergency compression failed: {ex}", exc_info=True)
+                    if new_msgs is not None:
+                        _remark_cache_breakpoints(new_msgs)
+                        payload["messages"] = new_msgs
+                        current_messages = new_msgs
+                        msg_chars = compressor._count_chars(new_msgs)
+                        body = json.dumps(payload).encode()
+                        headers = _forward_headers(req_headers, body, strip_encoding=True)
+                        record["emergency"] = True
+                        record["injected"] = injected = True
+                        conn = _upstream_conn()
+                        t_fwd = time.perf_counter()  # 重置:压缩耗时计入 overhead,prefill 仍只量上游
+                        conn.request("POST", upstream_full_path, body=body, headers=headers)
+                        resp = conn.getresponse()
+                        log.info(
+                            f"[MSG] Emergency-compressed retry -> {resp.status} "
+                            f"({len(body):,} bytes)"
+                        )
+                    else:
+                        prebuffered = err_preview  # 压不出可压旧消息 → 原样回 400
+                else:
+                    prebuffered = err_preview      # 非超限类 400 → 原样回 CC
 
             self.send_response(resp.status)
             resp_headers = resp.getheaders()
@@ -978,21 +1096,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
             total_bytes = 0
             total_input = 0
             chunks = 0  # 收到的数据块数:真流式应有几十~上百块;个位数=上游把整条流缓冲后一次性吐出
-            while True:
-                # read1: 同上,逐 SSE 事件即时 flush,消除 8KB 批缓冲卡顿。
-                chunk = resp.read1(8192)
-                if not chunk:
-                    break
-                if t_first is None:
-                    t_first = time.perf_counter()  # 首字到达:prefill(输入处理)结束、生成开始
-                chunks += 1
-                self.wfile.write(chunk)
+            if prebuffered is not None:
+                # 非重试的 400:错误体已整体读出(conn 已关),直接回写,不再走 read1 循环。
+                self.wfile.write(prebuffered)
                 self.wfile.flush()
-                total_bytes += len(chunk)
-                # 正常流式响应要缓存以解析 usage;错误响应(任意 stream 取值)也缓存一小段,
-                # 用于判定来源(CF 还是上游)。错误体都很小,封顶 64KB 防御异常大包。
-                if is_streaming or (resp.status >= 400 and len(buffer) < 65536):
-                    buffer += chunk
+                buffer = prebuffered
+                total_bytes = len(prebuffered)
+                chunks = 1
+            else:
+                while True:
+                    # read1: 同上,逐 SSE 事件即时 flush,消除 8KB 批缓冲卡顿。
+                    chunk = resp.read1(8192)
+                    if not chunk:
+                        break
+                    if t_first is None:
+                        t_first = time.perf_counter()  # 首字到达:prefill(输入处理)结束、生成开始
+                    chunks += 1
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    total_bytes += len(chunk)
+                    # 正常流式响应要缓存以解析 usage;错误响应(任意 stream 取值)也缓存一小段,
+                    # 用于判定来源(CF 还是上游)。错误体都很小,封顶 64KB 防御异常大包。
+                    if is_streaming or (resp.status >= 400 and len(buffer) < 65536):
+                        buffer += chunk
 
             log.info(f"[MSG] Done streaming {total_bytes:,} bytes")
 

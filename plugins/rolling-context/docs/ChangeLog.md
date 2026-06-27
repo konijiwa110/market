@@ -1,5 +1,35 @@
 # ChangeLog
 
+## 1.10.0 — 代理永不超发:未命中缓存的超限请求,当场同步压一次再重试,CC 端永不见 400
+
+### 背景(后台异步压缩的固有竞态 + autoCompact 跟着遭殃）
+旧路径压缩只在后台异步跑:总 hash 链未命中、且这一发请求已经超出上游上限时,代理会把**整条未压缩的
+原始请求**(实测可达 2.1M tokens)裸转给上游 → 上游 400 `prompt is too long: N tokens > 1000000
+maximum`,这发 400 直接回到 CC,界面表现为「上下文 100% → 触发原生压缩 → 压缩又失败」。更糟的是 CC
+自己的 autoCompact/`/compact` 摘要请求**也走这个代理**,同样因未命中而超限被拒——于是连「把真实
+transcript 焊小」这条唯一的持久收敛路径也被堵死;插件一旦停用/换客户端,上下文又从头跑一遍累积量,
+可能直接超过模型上限。
+
+### 变更:超限 400 → 同步压缩 → 重试一发(`proxy/server.py`)
+- 转发后拿到上游 `400` 且本发**未注入过**压缩时,先读出错误体判型:`_looks_too_long` 命中「prompt
+  too long / maximum…token」类才触发兜底,鉴权/格式类 400 原样回 CC。
+- `_parse_reported_tokens` 从错误串里取上游自报的**真实 token 数**(如 2100398)作 keep 比例分母 →
+  一次压到上限内(解析不到再用 `字符数/3` 粗估兜底)。
+- `_emergency_compress` 当场同步压一次,产出**完整新消息数组**换进请求体、重打一发上游,只把这发
+  成功结果流式回 CC;并把这次压缩**登记进 store**(prefix + key 链),后续请求直接命中、不再付同步延迟。
+  **最多重试一发**(压不出可压旧消息、或重试仍失败,则原样回那发 400,绝不成环)。
+- 副作用收益:CC 自己的 autoCompact/`/compact` 那发超限摘要请求经此兜底得以**成功**,真实 transcript
+  被持久焊小——这正是「停插件/换客户端后上下文也维持在压缩态」所依赖的机制。
+- 开关 `ROLLING_CONTEXT_EMERGENCY_COMPRESS`(默认开,设 `0/false/off/no` 关闭)。
+- 抽出 `_compression_key_hashes` / `_remark_cache_breakpoints` 两个辅助,后台压缩与同步兜底共用,
+  保证两条路径产出的匹配 key 与缓存断点完全一致。
+
+### 实测(2026-06-27)
+新增 `proxy/test_emergency.py`(stdlib `unittest`、隔离 HOME/状态目录、不碰 5588):覆盖
+`_looks_too_long`(超限/最大 token 措辞命中,鉴权 400 与乱码字节不误触)、`_parse_reported_tokens`
+(含千分位)、`_compression_key_hashes`(只 key 被摘段、与后台路径一致、跳过头部既有 summary 对)。
+10 例全绿;既有 `test_lifecycle` 2 例无回归。
+
 ## 1.9.1 — 堵掉 1.9.0 的升级假成功:启动后校验「起来的确实是本版本」+ 占位者腾位 + 冒烟测试
 
 ### 背景(1.9.0 自查发现的真洞)
