@@ -218,6 +218,10 @@ if not isinstance(settings.get("env"), dict):
 env = settings["env"]
 has_cfg_upstream = bool(cfg.get("upstream"))
 
+# 「指向本代理」按端口级判断(127.0.0.1:PORT),与 start-proxy.ps1 口径一致——
+# 否则本机另跑别的端口的 127.0.0.1 上游时,会被误当本代理而漏掉链式/fail-open。
+local_marker = proxy_url.split("//", 1)[-1]  # 127.0.0.1:PORT
+
 if healthy:
     if has_cfg_upstream:
         # 权威:上游来自 config(server.py 直读),这里只把 claude 指向本地代理。
@@ -225,7 +229,7 @@ if healthy:
         print("ok: BASE_URL=%s upstream=%s (config)" % (proxy_url, cfg["upstream"]))
     else:
         existing = env.get("ANTHROPIC_BASE_URL", "")
-        if existing and "127.0.0.1" not in existing:
+        if existing and local_marker not in existing:
             env["ROLLING_CONTEXT_UPSTREAM"] = existing
             print("ok: chaining upstream=%s" % existing)
         else:
@@ -249,7 +253,7 @@ else:
     if fail_target:
         env["ANTHROPIC_BASE_URL"] = fail_target
         print("failopen: BASE_URL=%s (proxy down)" % fail_target)
-    elif existing and "127.0.0.1" in existing:
+    elif existing and local_marker in existing:
         env.pop("ANTHROPIC_BASE_URL", None)
         print("failopen: removed BASE_URL -> default API (proxy down)")
     else:

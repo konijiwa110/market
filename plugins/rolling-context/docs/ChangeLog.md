@@ -1,5 +1,34 @@
 # ChangeLog
 
+## 1.14.0 — 第二轮审查(compressor / stats / hooks)四处加固:统计隔离、文件压实、空响应防护、脚本对齐
+
+### 背景
+1.13 审查只覆盖了 `server.py`。这轮把审查扩到此前未细看的 `compressor.py`、`stats.py` 与四个
+hook 脚本,修掉一处确定的隔离泄漏和三处健壮性/一致性遗漏。
+
+### 变更
+- **统计落盘尊重隔离目录(`proxy/server.py`)**:`stats = StatsCollector()` 原用 `stats.py` 里硬编码的
+  `~/.claude/rolling-context-stats.jsonl`,而 pid/version/store 三个状态文件都走 `_CLAUDE_DIR`
+  (读 `ROLLING_CONTEXT_STATE_DIR`)。后果是隔离实例(冒烟测试、`ROLLING_CONTEXT_DEV` 备用实例)会把
+  统计写进真实 `~/.claude`、污染生产数据。改为从 `_CLAUDE_DIR` 拼路径传入,与其余状态文件一致。
+- **统计 JSONL 压实防无界增长(`proxy/stats.py`)**:内存环形缓冲有 `MAX_RECORDS` 上限,但落盘文件
+  只追加从不轮转,长存进程会让文件无限涨;且 `_load` 用 `readlines()` 整文件读进内存只为取尾部。
+  新增 `_compact_locked()`:**启动时**若文件行数超上限即压实一次,**运行期**每追加满一个上限量
+  再压实一次(`tmp` + `os.replace` 原子替换);文件写移入锁内,压实与并发写无竞态。文件稳态
+  ≤ ~2×上限行。
+- **摘要器空响应防护(`proxy/compressor.py`)**:`_summarize_chunk` 末尾直接 `data["content"][0]["text"]`,
+  若上游回 200 但 `content` 为空(罕见 stop_reason / 拒答)会裸抛 `IndexError`,而自愈层只兜
+  `RuntimeError` → 整次压缩失败。改为校验后抛**受控 `RuntimeError`**,`finally` 仍正常记一条统计。
+- **平台脚本本地地址判断对齐(`hooks/start-proxy.sh`)**:判断「BASE_URL 是否指向本代理」时,`.ps1` 用
+  端口级正则 `127\.0\.0\.1.*$Port`,`.sh` 只判 `"127.0.0.1" in existing`。本机另跑别的端口的本地上游时
+  两端链式/fail-open 行为会分叉。`.sh` 改用端口级标记 `127.0.0.1:PORT`,与 `.ps1` 口径一致。
+
+### 实测(2026-06-27)
+新增 `proxy/test_stats.py`(运行期压实封顶、启动压实超大历史、未达上限重开不丢)、
+`proxy/test_compressor.py`(空 / 缺 `content` 抛 `RuntimeError`、正常内容仍返回),
+`test_emergency.py` 增 `StatsPathIsolation`(统计路径落在隔离目录)。
+全套 `test_stats` + `test_compressor` + `test_emergency` + `test_lifecycle` 合计 **33 例全绿**。
+
 ## 1.13.0 — 整体功能审查后的四处加固:发布顺序竞态、日志降噪、内存封顶、emergency 回收
 
 ### 背景

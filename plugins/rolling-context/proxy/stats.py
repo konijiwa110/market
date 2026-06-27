@@ -58,6 +58,7 @@ class StatsCollector:
         self._path = path
         self._lock = threading.Lock()
         self._records = collections.deque(maxlen=max_records)
+        self._appends = 0          # 自上次压实以来的追加条数,用于触发周期压实
         self._load()
 
     def _load(self):
@@ -75,14 +76,35 @@ class StatsCollector:
                 self._records.append(json.loads(line))
             except Exception:
                 continue
+        # 文件行数超过内存上限 = 有冗余历史:启动时压实一次,既防文件无界增长,
+        # 也避免下次 _load 的 readlines 把已涨大的文件整体读进内存。构造期单线程,直接调用安全。
+        if len(lines) > self._records.maxlen:
+            self._compact_locked()
 
     def record(self, rec: dict):
         """Append one request record to memory and the JSONL file."""
         with self._lock:
             self._records.append(rec)
+            try:
+                with open(self._path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+            # 每追加满一个上限量压实一次:文件稳态 ≤ ~2×maxlen 行,长存进程也不会无界增长。
+            self._appends += 1
+            if self._appends >= self._records.maxlen:
+                self._appends = 0
+                self._compact_locked()
+
+    def _compact_locked(self):
+        """用当前内存环形缓冲重写 JSONL,丢弃超出上限的历史。须在持锁下(或构造期单线程)调用。
+        tmp + os.replace 原子替换,避免别处读到半截文件。"""
         try:
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for r in self._records:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            os.replace(tmp, self._path)
         except Exception:
             pass
 

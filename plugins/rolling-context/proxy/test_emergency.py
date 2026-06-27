@@ -484,5 +484,17 @@ class EmergencyRetryEndToEnd(unittest.TestCase):
         self.assertEqual(len(server.store.compressions), 1)
 
 
+class StatsPathIsolation(unittest.TestCase):
+    """统计落盘路径必须走 _CLAUDE_DIR(尊重 ROLLING_CONTEXT_STATE_DIR),与 pid/version/store 一致;
+    否则隔离实例(本测试、DEV 备用实例)会污染真实 ~/.claude/rolling-context-stats.jsonl。"""
+
+    def test_stats_path_under_isolated_state_dir(self):
+        self.assertEqual(
+            os.path.normcase(os.path.abspath(server.stats._path)),
+            os.path.normcase(os.path.abspath(os.path.join(_TMP, "rolling-context-stats.jsonl"))),
+            "stats must write under ROLLING_CONTEXT_STATE_DIR, not the real ~/.claude",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

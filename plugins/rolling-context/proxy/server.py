@@ -543,7 +543,9 @@ store = CompressionStore()
 
 # 请求级统计采集器:每个真实 /v1/messages 生成调用记一条(token + 各类耗时),
 # 内存环形缓冲 + JSONL 落盘,供 /stats 看板读取。
-stats = StatsCollector()
+# 落盘路径走 _CLAUDE_DIR(尊重 ROLLING_CONTEXT_STATE_DIR),与 pid/version/store 一致——
+# 否则隔离实例(冒烟测试、DEV 备用实例)会污染真实 ~/.claude 的统计文件。
+stats = StatsCollector(path=os.path.join(_CLAUDE_DIR, "rolling-context-stats.jsonl"))
 
 
 def _record_compression_call(rec: dict):

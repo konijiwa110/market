@@ -438,7 +438,16 @@ class RollingCompressor:
             usage = data.get("usage") or {}
             in_tok = usage.get("input_tokens", 0) or 0
             out_tok = usage.get("output_tokens", 0) or 0
-            return data["content"][0]["text"]
+            # 200 但 content 为空(罕见的 stop_reason/拒答)→ 直接取 [0]["text"] 会裸抛 IndexError,
+            # 而上层只兜 RuntimeError,会让整次压缩失败。这里收成受控 RuntimeError(finally 仍记一条统计)。
+            content = data.get("content")
+            text = content[0].get("text") if (isinstance(content, list) and content
+                                              and isinstance(content[0], dict)) else None
+            if not text:
+                raise RuntimeError(
+                    f"Summarization API returned empty content (stop_reason={data.get('stop_reason')})"
+                )
+            return text
         except Exception as e:
             # 连接/超时(无 HTTP 状态)也记下来,err_snippet 取异常文本。
             if status == 0 and not err_snippet:
