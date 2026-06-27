@@ -110,6 +110,26 @@ def _cfg(key: str, env_key: str, default):
 LISTEN_PORT = int(_cfg("port", "ROLLING_CONTEXT_PORT", 5588))
 
 
+def _plugin_version() -> str:
+    """本进程跑的插件版本：读同源 ../.claude-plugin/plugin.json（与代码同处一份,绝不漂移）。
+    供 /health 自报 + 写权威 version 文件,让 hook 的版本闸门直接问活着的代理,不再靠猜。"""
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".claude-plugin", "plugin.json")
+        with open(p, encoding="utf-8-sig") as f:
+            v = (json.load(f) or {}).get("version")
+            if v:
+                return str(v)
+    except Exception:
+        pass
+    return os.environ.get("ROLLING_CONTEXT_VERSION", "unknown")
+
+
+VERSION = _plugin_version()
+_CLAUDE_DIR = os.path.join(os.path.expanduser("~"), ".claude")
+PID_FILE = os.path.join(_CLAUDE_DIR, "rolling-context-proxy.pid")
+VER_FILE = os.path.join(_CLAUDE_DIR, "rolling-context-proxy.version")
+
+
 def _load_upstream() -> str:
     """Resolve the upstream API endpoint.
 
@@ -686,6 +706,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         )
         data = {
             "status": "ok",
+            "version": VERSION,
+            "pid": os.getpid(),
             "trigger_tokens": TRIGGER_TOKENS,
             "target_tokens": TARGET_TOKENS,
             "summarizer_model": SUMMARIZER_MODEL,
@@ -1108,6 +1130,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 class ThreadedHTTPServer(HTTPServer):
     """Handle each request in a new thread."""
+    # 绑定即锁:关掉 SO_REUSEADDR,让第二个实例 bind 必然 EADDRINUSE 失败(Windows 默认开
+    # REUSEADDR 会允许两个进程抢占同端口 → 双实例)。配合 main() 捕获后 exit(0),并发启动里
+    # 抢锁失败者干净退出,根治原先「杀端口 + 猜 PID」那套 TOCTOU。
+    # (Linux 重负载下杀旧起新偶遇残留 TIME_WAIT 连接可能短暂 EADDRINUSE,会自愈;Windows 监听端口
+    #  在进程退出即释放,无此问题——而本插件主力在 Windows。)
+    allow_reuse_address = False
+
     def process_request(self, request, client_address):
         t = threading.Thread(target=self._handle, args=(request, client_address))
         t.daemon = True
@@ -1123,14 +1152,32 @@ class ThreadedHTTPServer(HTTPServer):
 
 
 def main():
-    log.info(f"Starting Rolling Context Proxy on port {LISTEN_PORT}")
+    log.info(f"Starting Rolling Context Proxy v{VERSION} on port {LISTEN_PORT}")
     log.info(f"  Trigger at: {TRIGGER_TOKENS:,} tokens")
     log.info(f"  Compress down to: {TARGET_TOKENS:,} tokens (recent context)")
     log.info(f"  Summarizer model: {SUMMARIZER_MODEL}")
     log.info(f"  Forwarding to: {UPSTREAM_URL}")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
 
-    server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
+    # 绑定即锁:端口被占 = 已有实例在跑,干净退出(exit 0),绝不抢占成双实例。
+    try:
+        server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
+    except OSError as e:
+        log.warning(f"Port {LISTEN_PORT} already in use ({e}); another instance owns it — exiting cleanly.")
+        sys.exit(0)
+
+    # 绑定成功 = 本进程是唯一实例,自报权威 PID/版本(取代 hook 猜 PID:包装层/重定向会让 hook 记错
+    # PID,而进程自己写的永远准)。hook 与 refresh 据此判活、判版本。
+    try:
+        os.makedirs(_CLAUDE_DIR, exist_ok=True)
+        with open(PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        with open(VER_FILE, "w", encoding="utf-8") as f:
+            f.write(VERSION)
+    except Exception as e:
+        log.warning(f"Could not write pid/version file: {e}")
+    log.info(f"  PID: {os.getpid()}  (pidfile: {PID_FILE})")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

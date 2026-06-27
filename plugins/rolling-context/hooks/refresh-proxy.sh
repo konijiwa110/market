@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
-# 一键刷新全局网关(Linux/macOS/Git-Bash)。
+# Restart the local rolling-context gateway (Linux/macOS/Git-Bash) — dev convenience.
 #
-# 这是「更新网关」的唯一动作:拉取 marketplace clone 的最新代码,然后重启那个全局 5588 网关。
-#   - 不需要 /plugin update(网关从 clone 跑,不从 cache 版本目录跑)
-#   - 不需要重启 Claude Code(网关是独立进程,重启它即生效)
-#   - 所有 Claude Code 客户端共用同一个 5588 网关,刷新一次,全体立即用上新代码
+# 用途:就地重启本机网关(改完 server.py 想立刻生效,不必等下个会话的 SessionStart)。
+# 它只做两件事:① 杀掉占用端口的监听进程 ② 重跑 start-proxy.sh(自动尊重 ROLLING_CONTEXT_DEV)。
+# 代码更新走正常渠道:生产用 `/plugin update`;开发设 ROLLING_CONTEXT_DEV=<仓库根> 直接跑仓库。
 #
-# 用法:在 Claude Code 里输入   ! bash ~/.claude/plugins/cache/konijiwa-plugin/rolling-context/<版本>/hooks/refresh-proxy.sh
-# 或直接在终端跑这个脚本。
+# 用法:在 Claude Code 里输入   ! bash <...>/hooks/refresh-proxy.sh   或直接在终端跑。
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
-PIDFILE="$CLAUDE_DIR/rolling-context-proxy.pid"
-VERFILE="$CLAUDE_DIR/rolling-context-proxy.version"
 CONFIG_FILE="$CLAUDE_DIR/rolling-context.json"
 
 IS_WINDOWS=false
@@ -33,26 +29,7 @@ PYEOF
 )
 [ -z "$PORT" ] && PORT=5588
 
-# 解析 clone 仓库根(marketplace git 仓库)。$SCRIPT_DIR 可能在 cache 下,也可能就在 clone 下。
-CLONE_ROOT=""
-case "$SCRIPT_DIR" in
-  */cache/*)
-    _PR="$(cd "$SCRIPT_DIR/../../../../.." 2>/dev/null && pwd)"
-    _MP="$(basename "$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd)")"
-    CLONE_ROOT="$_PR/marketplaces/$_MP" ;;
-  */marketplaces/*)
-    CLONE_ROOT="$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd)" ;;
-esac
-
-# 1) 拉最新(尽力而为;--ff-only 在分叉时失败但不破坏 clone)。
-if [ -n "$CLONE_ROOT" ] && [ -d "$CLONE_ROOT/.git" ]; then
-    echo "[refresh] git pull --ff-only  ($CLONE_ROOT)"
-    git -C "$CLONE_ROOT" pull --ff-only || echo "[refresh] pull 跳过/失败,用现有 clone 代码重启"
-else
-    echo "[refresh] 未发现 clone 仓库,直接用现有代码重启"
-fi
-
-# 2) 按端口杀掉在跑的网关 —— 比读 pidfile 可靠(绕开 git-bash 下 \$! 拿到包装层 PID 的老问题)。
+# 1) 按端口杀掉在跑的网关 —— 比读 pidfile 可靠(绕开 git-bash 下 $! 拿到包装层 PID 的老问题)。
 _listeners() {
     if [ "$IS_WINDOWS" = true ]; then
         netstat -ano 2>/dev/null | grep "127.0.0.1:$PORT " | grep -i listening | awk '{print $NF}' | sort -u
@@ -68,19 +45,28 @@ for p in $(_listeners); do
         kill "$p" 2>/dev/null; sleep 1; kill -9 "$p" 2>/dev/null
     fi
 done
-rm -f "$PIDFILE" "$VERFILE"
 sleep 1
 
-# 3) 用标准启动器从 clone 重新拉起(start-proxy 会自动解析 clone 源)。
-echo "[refresh] 重新启动网关..."
+# 2) 重跑标准启动器:从 cache(或 ROLLING_CONTEXT_DEV 指定的仓库)起新代理,
+#    由 server.py 自写权威 pidfile/version、自答 /health。
+DEV=""; [ -n "${ROLLING_CONTEXT_DEV:-}" ] && DEV=" [DEV]"
+echo "[refresh] 重新启动网关 via start-proxy.sh$DEV ..."
 bash "$SCRIPT_DIR/start-proxy.sh" >/dev/null 2>&1
 
-# 4) 自愈 pidfile:写入真正监听该端口的 PID。
-sleep 2
-REAL_PID="$(_listeners | head -1)"
-if [ -n "$REAL_PID" ]; then
-    echo "$REAL_PID" > "$PIDFILE"
-    echo "[refresh] ✅ 网关已就绪,监听 $PORT,PID $REAL_PID(版本 $(cat "$VERFILE" 2>/dev/null))"
+# 3) 报告:问 /health 确认起来了。
+sleep 1
+HEALTH=$(_py - "http://127.0.0.1:$PORT" <<'PYEOF' 2>/dev/null
+import sys, json, urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1] + "/health", timeout=3) as r:
+        d = json.load(r)
+    print("v%s PID %s" % (d.get("version", "?"), d.get("pid", "?")))
+except Exception:
+    pass
+PYEOF
+)
+if [ -n "$HEALTH" ]; then
+    echo "[refresh] OK   网关已就绪,监听 $PORT ($HEALTH)"
 else
-    echo "[refresh] ⚠ 未检测到 $PORT 监听,请查看 $CLAUDE_DIR/rolling-context-proxy.log"
+    echo "[refresh] WARN 未检测到 $PORT 健康网关,请查看 $CLAUDE_DIR/rolling-context-proxy.log"
 fi

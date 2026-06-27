@@ -1,5 +1,40 @@
 # ChangeLog
 
+## 1.9.0 — 网关生命周期改「健康自识别 + 失败开放」:从 cache 跑、绑定即锁、代理挂了也不挡 CC
+
+### 背景(取代 1.8.2 的「从 marketplace clone 跑」模型)
+1.8.2 把网关代码源绑到 marketplace clone(`marketplaces/<MP>/plugins/rolling-context/proxy`),
+更新靠 `git pull` + `refresh-proxy`。坑:① 依赖那份 clone 一直在、且能 `git pull`(CI/无网/clone 被清
+就跑不起来);② hook 仍靠 pidfile 猜在跑哪个 PID,git-bash 下 `$!` 拿到的是包装层 PID,pidfile 跟真实
+监听者对不上,杀错/复用错;③ 代理一旦没起来,`ANTHROPIC_BASE_URL` 已指向 5588,CC 直接连不上、整个会话
+废掉(没有「压不了就裸传」的退路)。
+
+### 变更:代理自报身份,hook 只看 `/health`
+- `proxy/server.py`:
+  - **绑定即锁**:`ThreadedHTTPServer.allow_reuse_address = False`,`server_bind()` 撞 `EADDRINUSE`
+    即**干净 `exit(0)`**(清掉自己写过的 stale pidfile)。并发起的第二个实例不会双绑抢端口——谁先绑上谁是
+    单例,后来者自动让位。根治「双实例抢 5588」。
+  - **绑定成功后自写 pidfile**:写真正监听端口的进程 PID + 版本到 `~/.claude/rolling-context-proxy.pid`,
+    绕开 hook 在 git-bash 下拿到包装层 PID 的老坑(PID 不再靠 hook 猜)。
+  - `/health` 新增 `version`(读 `../.claude-plugin/plugin.json`)与 `pid` 字段——代理**自报身份**,
+    版本/PID 单一权威来源就是活着的代理本身,不再依赖 verfile/pidfile 这些旁路记号。
+- `hooks/start-proxy.{ps1,sh}`:
+  - **默认从 cache 跑**(回到标准 `/plugin update` 升级链路);`ROLLING_CONTEXT_DEV=/path/to/repo`
+    可覆盖到开发源(本仓库 clone)做本地联调,日志标 `[DEV]`。
+  - **版本闸门改读 `/health`**(不再读 verfile):在跑版本 ≥ 本会话版本则复用;旧版/识别不出版本(老代理
+    /health 无 version)则视作需要升级 → 重启。仍是只升不降,沿用 1.8.1 的反互踢语义。
+  - **失败开放(fail-open)**:起完代理后再探一次 `/health`——健康才把 `ANTHROPIC_BASE_URL` 指 5588;
+    代理没起来则**回退到上游**(settings.json 里的真实 baseURL),CC 照常工作(只是这一程没压缩),
+    绝不因代理挂掉把会话也带死。
+- `hooks/refresh-proxy.{ps1,sh}`:删掉 clone 解析 / `git pull` / pidfile 自愈,**瘦成纯本地重启**助手
+  (按端口杀监听者 + 重跑 start-proxy,尊重 `ROLLING_CONTEXT_DEV`)。
+- `.ps1` 统一 **UTF-8 BOM**:让 GBK 区的 PS 5.1 正确解码脚本里的中文串(比「全 ASCII」更省心,中文注释/
+  提示都能留)。`.sh` 仍无 BOM UTF-8。
+
+### 升级方式
+`/plugin marketplace update konijiwa-plugin` → `/plugin update` 把 1.9.0 进 cache;下一个 CC 会话的 hook
+探到 `/health` 版本变化即自动重启代理到新版。5588 仍是全体会话共享的单例;代理挂了走失败开放、不挡 CC。
+
 ## 1.8.1 — 修掉 giant 会话压缩失败(摘要器 200K 超限),压缩调用进看板,标记压缩生效点
 
 ### 背景(1.8.0 上线后从生产日志发现)

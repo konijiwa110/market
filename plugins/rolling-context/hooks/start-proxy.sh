@@ -1,30 +1,32 @@
 #!/usr/bin/env bash
 # Ensure rolling context proxy is running
-# Pure stdlib — no venv needed, just python
+# Pure stdlib — no venv needed, just python.
+#
+# 生命周期模型(对齐上游原版,并修掉 fail-closed):
+#   • 代码默认从本地 cache 副本跑:<...>/rolling-context/<VER>/proxy。CC 通过 `/plugin update`
+#     拉新 cache、起新会话即生效 —— CC 掌舵生命周期,hook 只负责「该起就起」。
+#   • 作者本地提速:设 ROLLING_CONTEXT_DEV=<仓库根> 则改从仓库跑(免 /plugin update),
+#     仅本机本人有用,绝不写进任何全局清单、不污染生产生命周期。
+#   • fail-open:仅当代理 /health 真活着才把 ANTHROPIC_BASE_URL 指向它;它起不来就放行到真上游,
+#     绝不因代理挂掉而连累整个 Claude Code。
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# 网关代码源:优先用 marketplace clone(单一最新源——`/plugin marketplace update` 或 `git pull`
-# 刷新它即可,更新网关无需 /plugin update 重新 cache、无需重启 CC)。找不到 clone 时回退到本地
-# cache 副本(可移植)。$SCRIPT_DIR 形如 <plugins>/cache/<MP>/rolling-context/<VER>/hooks。
+
+# 1) 选代码源:默认 cache 副本;ROLLING_CONTEXT_DEV 指向仓库时改用仓库(作者本地提速)。
 PROXY_DIR="$SCRIPT_DIR/../proxy"
-SRC_PLUGIN_JSON="$SCRIPT_DIR/../.claude-plugin/plugin.json"
-case "$SCRIPT_DIR" in
-  */cache/*)
-    _PLUGINS_ROOT="$(cd "$SCRIPT_DIR/../../../../.." 2>/dev/null && pwd)"
-    _MP_NAME="$(basename "$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd)")"
-    _CLONE="$_PLUGINS_ROOT/marketplaces/$_MP_NAME/plugins/rolling-context"
-    if [ -f "$_CLONE/proxy/server.py" ]; then
-        PROXY_DIR="$_CLONE/proxy"
-        SRC_PLUGIN_JSON="$_CLONE/.claude-plugin/plugin.json"
-    fi
-    ;;
-esac
+if [ -n "$ROLLING_CONTEXT_DEV" ] && [ -f "$ROLLING_CONTEXT_DEV/proxy/server.py" ]; then
+    PROXY_DIR="$ROLLING_CONTEXT_DEV/proxy"
+fi
+PROXY_DIR="$(cd "$PROXY_DIR" 2>/dev/null && pwd)"
+SRC_PLUGIN_JSON="$PROXY_DIR/../.claude-plugin/plugin.json"
+
 PIDFILE="$HOME/.claude/rolling-context-proxy.pid"
-VERFILE="$HOME/.claude/rolling-context-proxy.version"
 HOOKLOG="$HOME/.claude/rolling-context-hook.log"
+SETTINGS_FILE="$HOME/.claude/settings.json"
 CONFIG_FILE="$HOME/.claude/rolling-context.json"
+
 # Detect Windows (git bash) — 必须在选 python 之前:Windows 的 python3 常是
-# 微软商店空壳(command -v 命中但无输出),会让端口探测拿到空串。
+# 微软商店空壳(command -v 命中但无输出),会让探测拿到空串。
 if [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]]; then
     IS_WINDOWS=true
 else
@@ -37,6 +39,7 @@ elif command -v python3 &>/dev/null; then
 else
     _py() { python "$@"; }
 fi
+
 # 端口取自 rolling-context.json > 环境变量 > 5588。
 PORT=$(_py - "$CONFIG_FILE" <<'PYEOF'
 import json, sys, os
@@ -47,7 +50,6 @@ except Exception:
 print(c.get("port") or os.environ.get("ROLLING_CONTEXT_PORT") or 5588)
 PYEOF
 )
-# 兜底:任何原因导致 PORT 为空(python 缺失/异常)都不能让 URL 丢端口。
 [ -z "$PORT" ] && PORT=5588
 PROXY_URL="http://127.0.0.1:$PORT"
 CURRENT_VERSION=$(cat "$SRC_PLUGIN_JSON" 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')
@@ -56,84 +58,23 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HOOKLOG"
 }
 
-log "Hook started. PROXY_DIR=$PROXY_DIR IS_WINDOWS=$IS_WINDOWS"
-
-# Always update settings.json first (even if proxy is already running)
-SETTINGS_FILE="$HOME/.claude/settings.json"
-update_settings() {
-    local py_cmd=""
-    if [ "$IS_WINDOWS" = true ]; then
-        py_cmd="python"
-    elif command -v python3 &>/dev/null; then
-        py_cmd="python3"
-    else
-        py_cmd="python"
-    fi
-
-    $py_cmd - "$SETTINGS_FILE" "$PROXY_URL" <<'PYEOF'
-import json, sys, os
-
-settings_file = sys.argv[1]
-proxy_url = sys.argv[2]
-
-def _load(p):
-    try:
-        with open(p, encoding="utf-8") as f:
-            d = json.load(f)
-            return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-settings = _load(settings_file)
-cfg = _load(os.path.join(os.path.expanduser("~"), ".claude", "rolling-context.json"))
-
-if "env" not in settings or not isinstance(settings["env"], dict):
-    settings["env"] = {}
-env = settings["env"]
-
-if cfg.get("upstream"):
-    # 权威：上游来自 rolling-context.json（server.py 直接读），这里只强制把 claude 指向代理。
-    env["ANTHROPIC_BASE_URL"] = proxy_url
-    print("authoritative")
-else:
-    existing = env.get("ANTHROPIC_BASE_URL", "")
-    if not existing:
-        env["ANTHROPIC_BASE_URL"] = proxy_url
-        print("set")
-    elif "127.0.0.1" not in existing:
-        env["ROLLING_CONTEXT_UPSTREAM"] = existing
-        env["ANTHROPIC_BASE_URL"] = proxy_url
-        print("chained")
-    else:
-        print("already")
-    defaults = {
-        "ROLLING_CONTEXT_PORT": "5588",
-        "ROLLING_CONTEXT_TRIGGER": "160000",
-        "ROLLING_CONTEXT_TARGET": "40000",
-        "ROLLING_CONTEXT_MODEL": "claude-haiku-4-5-20251001",
-    }
-    for key, value in defaults.items():
-        if key not in env:
-            env[key] = value
-
-with open(settings_file, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
+# 判活以「活着的 /health」为唯一权威(自报 version + pid),pidfile 仅兜底。
+# 健康 → 打印 "<version>\t<pid>";不健康 → 空输出。
+proxy_health() {
+    _py - "$PROXY_URL" <<'PYEOF'
+import sys, json, urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1] + "/health", timeout=2) as r:
+        d = json.load(r)
+    print("%s\t%s" % (d.get("version", ""), d.get("pid", "")))
+except Exception:
+    pass
 PYEOF
 }
 
-RESULT=$(update_settings 2>/dev/null)
-case "$RESULT" in
-    authoritative) log "Authoritative: ANTHROPIC_BASE_URL=$PROXY_URL (config upstream)" ;;
-    set)           log "Set ANTHROPIC_BASE_URL=$PROXY_URL (settings.json)" ;;
-    chained)       log "Chaining upstream (settings.json)" ;;
-    already)       log "ANTHROPIC_BASE_URL already set (settings.json)" ;;
-    *)             log "WARNING: Could not update settings.json" ;;
-esac
-
-# Check if proxy is already running
 _kill_pid() {
     local pid="$1"
+    [ -z "$pid" ] && return 0
     if [ "$IS_WINDOWS" = true ]; then
         powershell.exe -Command "Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue" 2>/dev/null
     else
@@ -145,6 +86,7 @@ _kill_pid() {
 
 _pid_alive() {
     local pid="$1"
+    [ -z "$pid" ] && return 1
     if [ "$IS_WINDOWS" = true ]; then
         powershell.exe -Command "if (Get-Process -Id $pid -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" 2>/dev/null
     else
@@ -152,45 +94,134 @@ _pid_alive() {
     fi
 }
 
-if [ -f "$PIDFILE" ]; then
-    PID=$(cat "$PIDFILE")
-    if _pid_alive "$PID"; then
-        # 版本闸门:同版本复用;在跑的版本 >= 本会话版本则复用(绝不降级);
-        # 仅当本会话版本严格更高才重启升级。根治多版本会话把 5588 共享代理来回拽、
-        # 每次重启掐断在传请求 + 清空压缩状态的「版本互踢」。
-        RUNNING_VERSION=$(cat "$VERFILE" 2>/dev/null)
-        if [ "$CURRENT_VERSION" = "$RUNNING_VERSION" ]; then
-            log "Proxy already running (PID $PID, v$RUNNING_VERSION)"
-            exit 0
-        fi
-        # sort -V 版本排序:取两者较大者。RUNNING 较大(>=)=> 复用,不降级。
+log "Hook started. PROXY_DIR=$PROXY_DIR v$CURRENT_VERSION IS_WINDOWS=$IS_WINDOWS$([ -n "$ROLLING_CONTEXT_DEV" ] && echo ' [DEV]')"
+
+# 2) 判活 + 升级闸门:
+#    • 在跑版本「可识别且 >= 本会话版本」→ 复用(绝不降级互踢)
+#    • 在跑版本更低,或无法识别(如旧代理 /health 不报 version)→ 重启,让新版/新代码顶上
+PROXY_HEALTHY=false
+HEALTH=$(proxy_health)
+if [ -n "$HEALTH" ]; then
+    RUNNING_VERSION=$(printf '%s' "$HEALTH" | cut -f1)
+    RUNNING_PID=$(printf '%s' "$HEALTH" | cut -f2)
+    REUSE=false
+    if [ -n "$RUNNING_VERSION" ] && [ "$RUNNING_VERSION" != "unknown" ] && \
+       [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" != "unknown" ]; then
         HIGHER=$(printf '%s\n%s\n' "$CURRENT_VERSION" "$RUNNING_VERSION" | sort -V | tail -1)
-        if [ -n "$RUNNING_VERSION" ] && [ "$HIGHER" = "$RUNNING_VERSION" ]; then
-            log "Proxy running newer/equal (PID $PID, v$RUNNING_VERSION >= v$CURRENT_VERSION) - reusing, no downgrade"
-            exit 0
-        fi
-        log "Upgrading proxy ($RUNNING_VERSION -> $CURRENT_VERSION), restarting proxy (PID $PID)"
-        _kill_pid "$PID"
+        [ "$HIGHER" = "$RUNNING_VERSION" ] && REUSE=true
     fi
-    rm -f "$PIDFILE" "$VERFILE"
+    if [ "$REUSE" = true ]; then
+        log "Proxy healthy (PID $RUNNING_PID, v$RUNNING_VERSION >= v$CURRENT_VERSION) - reusing"
+        PROXY_HEALTHY=true
+    else
+        log "Restarting proxy (running v${RUNNING_VERSION:-?} -> v$CURRENT_VERSION; stopping PID $RUNNING_PID)"
+        _kill_pid "$RUNNING_PID"
+        sleep 1
+    fi
 fi
 
-# Start proxy directly — no venv needed (pure stdlib)
-log "Starting proxy..."
-(
-    cd "$PROXY_DIR" || { log "ERROR: cannot cd to $PROXY_DIR"; exit 1; }
-    PYTHON_CMD=""
-    if [ "$IS_WINDOWS" = true ]; then
-        PYTHON_CMD="python"
-    elif command -v python3 &>/dev/null; then
-        PYTHON_CMD="python3"
-    else
-        PYTHON_CMD="python"
+# 3) 不健康(或刚为升级停掉)→ 启动一个新代理,轮询等就绪。
+if [ "$PROXY_HEALTHY" != true ]; then
+    # 兜底:pidfile 记的进程还活着但 /health 不通(卡死)→ 杀掉再起。
+    if [ -f "$PIDFILE" ]; then
+        PID=$(head -1 "$PIDFILE" 2>/dev/null)
+        if [ -n "$PID" ] && _pid_alive "$PID"; then
+            log "Stopping leftover proxy (PID $PID) before relaunch"
+            _kill_pid "$PID"
+            sleep 1
+        fi
     fi
-    nohup $PYTHON_CMD server.py > "$HOME/.claude/rolling-context-proxy.log" 2>&1 &
-    echo $! > "$PIDFILE"
-    echo "$CURRENT_VERSION" > "$VERFILE"
-    log "Proxy started with PID $! (v$CURRENT_VERSION)"
-) &
+    log "Starting proxy from $PROXY_DIR ..."
+    # server.py 绑定成功后自写 pidfile/version 并答 /health。绑定即锁:并发起的第二个会
+    # EADDRINUSE 后干净退出,不会双实例。这里不再杀端口、不再猜 PID。
+    (
+        cd "$PROXY_DIR" || { log "ERROR: cannot cd to $PROXY_DIR"; exit 1; }
+        if [ "$IS_WINDOWS" = true ]; then
+            PYTHON_CMD="python"
+        elif command -v python3 &>/dev/null; then
+            PYTHON_CMD="python3"
+        else
+            PYTHON_CMD="python"
+        fi
+        nohup $PYTHON_CMD server.py > "$HOME/.claude/rolling-context-proxy.log" 2>&1 &
+    ) &
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 0.5
+        [ -n "$(proxy_health)" ] && { PROXY_HEALTHY=true; break; }
+    done
+    if [ "$PROXY_HEALTHY" = true ]; then
+        log "Proxy is up (v$CURRENT_VERSION)"
+    else
+        log "WARNING: proxy did not become healthy in time - failing open to upstream"
+    fi
+fi
+
+# 4) 写 settings.json:健康才指向代理;否则 fail-open 放行到真上游(绝不连累 CC)。
+update_settings() {
+    _py - "$SETTINGS_FILE" "$PROXY_URL" "$1" <<'PYEOF'
+import json, sys, os
+
+settings_file, proxy_url, healthy = sys.argv[1], sys.argv[2], (sys.argv[3] == "true")
+
+def _load(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+settings = _load(settings_file)
+cfg = _load(os.path.join(os.path.expanduser("~"), ".claude", "rolling-context.json"))
+if not isinstance(settings.get("env"), dict):
+    settings["env"] = {}
+env = settings["env"]
+has_cfg_upstream = bool(cfg.get("upstream"))
+
+if healthy:
+    if has_cfg_upstream:
+        # 权威:上游来自 config(server.py 直读),这里只把 claude 指向本地代理。
+        env["ANTHROPIC_BASE_URL"] = proxy_url
+        print("ok: BASE_URL=%s upstream=%s (config)" % (proxy_url, cfg["upstream"]))
+    else:
+        existing = env.get("ANTHROPIC_BASE_URL", "")
+        if existing and "127.0.0.1" not in existing:
+            env["ROLLING_CONTEXT_UPSTREAM"] = existing
+            print("ok: chaining upstream=%s" % existing)
+        else:
+            print("ok: BASE_URL=%s" % proxy_url)
+        env["ANTHROPIC_BASE_URL"] = proxy_url
+        for k, v in {
+            "ROLLING_CONTEXT_PORT": "5588",
+            "ROLLING_CONTEXT_TRIGGER": "160000",
+            "ROLLING_CONTEXT_TARGET": "40000",
+            "ROLLING_CONTEXT_MODEL": "claude-haiku-4-5-20251001",
+        }.items():
+            env.setdefault(k, v)
+else:
+    # FAIL-OPEN:代理没起来 → BASE_URL 指回真上游(或移除回落官方 API),让 CC 照常工作。
+    fail_target = ""
+    if has_cfg_upstream:
+        fail_target = cfg["upstream"]
+    elif env.get("ROLLING_CONTEXT_UPSTREAM"):
+        fail_target = env["ROLLING_CONTEXT_UPSTREAM"]
+    existing = env.get("ANTHROPIC_BASE_URL", "")
+    if fail_target:
+        env["ANTHROPIC_BASE_URL"] = fail_target
+        print("failopen: BASE_URL=%s (proxy down)" % fail_target)
+    elif existing and "127.0.0.1" in existing:
+        env.pop("ANTHROPIC_BASE_URL", None)
+        print("failopen: removed BASE_URL -> default API (proxy down)")
+    else:
+        print("failopen: left BASE_URL as-is (proxy down)")
+
+with open(settings_file, "w", encoding="utf-8") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
+RESULT=$(update_settings "$PROXY_HEALTHY" 2>/dev/null)
+log "settings.json: ${RESULT:-WARNING could not update}"
 
 exit 0

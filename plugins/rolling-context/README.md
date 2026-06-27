@@ -59,6 +59,15 @@ git config --global --unset url.git@github.com:.insteadOf
 
 (Alternatively, to keep using SSH, register GitHub's host key once: `ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts`.)
 
+## Updating & lifecycle
+
+The proxy runs from Claude Code's plugin **cache** (`…/rolling-context/<version>/proxy`), and Claude Code owns its lifecycle — the SessionStart hook just makes sure it's running.
+
+- **Update**: `/plugin update rolling-context@konijiwa-plugin` pulls the new version into the cache; the next session's hook sees the newer version and restarts the proxy onto it. No manual steps, no terminal restart.
+- **Fail-open**: the hook points `ANTHROPIC_BASE_URL` at the local proxy **only after** it answers `/health`. If the proxy can't start, the hook falls back to your real upstream so Claude Code keeps working (just without compression) instead of stalling on a dead port.
+- **Singleton (bind-as-lock)**: the proxy holds the port as its lock — concurrent sessions share one instance, and a duplicate launch exits cleanly rather than racing. On bind it self-writes an authoritative pidfile + version, so liveness/version is read from the live `/health`, never guessed.
+- **Dev mode (authors only)**: set `ROLLING_CONTEXT_DEV=<repo-root>` to run the proxy straight from a working clone instead of the cache — iterate on `proxy/server.py` without `/plugin update`. Unset it to return to the normal cached lifecycle. `hooks/refresh-proxy.{ps1,sh}` restarts the local gateway in place after a code edit.
+
 ## Configuration
 
 Drop a `~/.claude/rolling-context.json` to override defaults. Every key is **config-first, environment-fallback**: if it's in the file it wins, otherwise it's read from the environment, otherwise the default applies.
@@ -109,9 +118,11 @@ The proxy is **fully stateless** — no sessions, no databases. It hashes messag
 ## Health Check / Debug
 
 ```
-curl http://127.0.0.1:5588/health
+curl http://127.0.0.1:5588/health             # {"status":"ok","version":"1.9.0","pid":12345, ...}
 curl http://127.0.0.1:5588/debug/compressions
 ```
+
+`/health` reports the running `version` and `pid` — the same fields the SessionStart hook uses to decide reuse-vs-restart and fail-open. A live dashboard is also served at `http://127.0.0.1:5588/stats`.
 
 ## Uninstall
 

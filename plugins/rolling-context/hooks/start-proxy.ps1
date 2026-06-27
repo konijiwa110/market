@@ -1,27 +1,30 @@
-# Ensure rolling context proxy is running (Windows)
-# Pure stdlib — no venv needed, just python
+﻿# Ensure rolling context proxy is running (Windows)
+# Pure stdlib — no venv needed, just python.
+#
+# 生命周期模型(对齐上游原版,并修掉 fail-closed):
+#   • 代码默认从本地 cache 副本跑:<...>\rolling-context\<VER>\proxy。CC 通过 `/plugin update`
+#     拉新 cache、起新会话即生效 —— CC 掌舵生命周期,hook 只负责「该起就起」。
+#   • 作者本地提速:设 ROLLING_CONTEXT_DEV=<仓库根> 则改从仓库跑(免 /plugin update),
+#     仅本机本人有用,绝不写进任何全局清单、不污染生产生命周期。
+#   • fail-open:仅当代理 /health 真活着才把 ANTHROPIC_BASE_URL 指向它;它起不来就放行到真上游,
+#     绝不因代理挂掉而连累整个 Claude Code。
 
 $ErrorActionPreference = "SilentlyContinue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-# 网关代码源:优先用 marketplace clone(单一最新源——`/plugin marketplace update` 或 `git pull`
-# 刷新它即可,更新网关无需 /plugin update 重新 cache、无需重启 CC)。找不到 clone 时回退到本地
-# cache 副本(可移植)。$ScriptDir 形如 <plugins>\cache\<MP>\rolling-context\<VER>\hooks。
-$ProxyDir = Join-Path $ScriptDir "..\proxy"
-$SrcPluginJson = Join-Path $ScriptDir "..\.claude-plugin\plugin.json"
-if ($ScriptDir -match '\\cache\\') {
-    $PluginsRoot = [System.IO.Path]::GetFullPath((Join-Path $ScriptDir "..\..\..\..\.."))
-    $MpName = Split-Path ([System.IO.Path]::GetFullPath((Join-Path $ScriptDir "..\..\..")))  -Leaf
-    $Cand = Join-Path $PluginsRoot "marketplaces\$MpName\plugins\rolling-context"
-    if (Test-Path (Join-Path $Cand "proxy\server.py")) {
-        $ProxyDir = Join-Path $Cand "proxy"
-        $SrcPluginJson = Join-Path $Cand ".claude-plugin\plugin.json"
-    }
+
+# 1) 选代码源:默认 cache 副本;ROLLING_CONTEXT_DEV 指向仓库时改用仓库(作者本地提速)。
+$ProxyDir = [System.IO.Path]::GetFullPath((Join-Path $ScriptDir "..\proxy"))
+$DevRoot = $env:ROLLING_CONTEXT_DEV
+if ($DevRoot -and (Test-Path (Join-Path $DevRoot "proxy\server.py"))) {
+    $ProxyDir = [System.IO.Path]::GetFullPath((Join-Path $DevRoot "proxy"))
 }
+$SrcPluginJson = Join-Path $ProxyDir "..\.claude-plugin\plugin.json"
+
 $ClaudeDir = Join-Path $env:USERPROFILE ".claude"
 $PidFile = Join-Path $ClaudeDir "rolling-context-proxy.pid"
-$VerFile = Join-Path $ClaudeDir "rolling-context-proxy.version"
 $HookLog = Join-Path $ClaudeDir "rolling-context-hook.log"
 $ProxyLog = Join-Path $ClaudeDir "rolling-context-proxy.log"
+$SettingsFile = Join-Path $ClaudeDir "settings.json"
 # 第三方 baseURL 配置（显式、稳定；存在时为权威，不再从 ANTHROPIC_BASE_URL 推导，杜绝来回横跳）。
 $ConfigFile = Join-Path $ClaudeDir "rolling-context.json"
 $Cfg = $null
@@ -36,124 +39,138 @@ function Log($msg) {
     Add-Content -Path $HookLog -Value "[$ts] $msg"
 }
 
-Log "Hook started. ProxyDir=$ProxyDir"
+# 判活以「活着的 /health」为唯一权威(自报 version + pid),pidfile 仅兜底。
+function Get-Health {
+    try {
+        return Invoke-RestMethod -Uri "$ProxyUrl/health" -TimeoutSec 2 -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
 
-# Always update settings.json first (even if proxy is already running)
-$SettingsFile = Join-Path $ClaudeDir "settings.json"
+Log "Hook started. ProxyDir=$ProxyDir v$CurrentVersion$(if ($DevRoot) { ' [DEV]' })"
+
+# 2) 判活 + 升级闸门:
+#    • 在跑版本「可识别且 >= 本会话版本」→ 复用(绝不降级互踢)
+#    • 在跑版本更低,或无法识别(如旧代理 /health 不报 version)→ 重启,让新版/新代码顶上
+$proxyHealthy = $false
+$health = Get-Health
+if ($health) {
+    $runningVersion = "$($health.version)".Trim()
+    $reuse = $false
+    if ($runningVersion -and $runningVersion -ne 'unknown' -and $CurrentVersion -and $CurrentVersion -ne 'unknown') {
+        try { $reuse = ([version]$runningVersion).CompareTo([version]$CurrentVersion) -ge 0 } catch { $reuse = $false }
+    }
+    if ($reuse) {
+        Log "Proxy healthy (PID $($health.pid), v$runningVersion >= v$CurrentVersion) - reusing"
+        $proxyHealthy = $true
+    } else {
+        $rv = if ($runningVersion) { $runningVersion } else { '?' }
+        Log "Restarting proxy (running v$rv -> v$CurrentVersion; stopping PID $($health.pid))"
+        if ($health.pid) { Stop-Process -Id ([int]$health.pid) -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 1
+    }
+}
+
+# 3) 不健康(或刚为升级停掉)→ 启动一个新代理,轮询等它就绪。
+if (-not $proxyHealthy) {
+    # 兜底:pidfile 记的进程还活着但 /health 不通(卡死)→ 杀掉再起。
+    if (Test-Path $PidFile) {
+        $savedPid = (Get-Content $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($savedPid -and (Get-Process -Id $savedPid -ErrorAction SilentlyContinue)) {
+            Log "Stopping leftover proxy (PID $savedPid) before relaunch"
+            Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    Log "Starting proxy from $ProxyDir ..."
+    # server.py 绑定成功后自写 pidfile/version 并答 /health。绑定即锁:若并发起了第二个,
+    # 它会 EADDRINUSE 后干净 exit 0,不会双实例。这里不再杀端口、不再猜 PID。
+    Start-Process -FilePath "python" -ArgumentList "server.py" `
+        -WorkingDirectory $ProxyDir `
+        -RedirectStandardOutput $ProxyLog -RedirectStandardError "$ProxyLog.err" `
+        -WindowStyle Hidden | Out-Null
+    for ($i = 0; $i -lt 10; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Get-Health) { $proxyHealthy = $true; break }
+    }
+    if ($proxyHealthy) {
+        Log "Proxy is up (v$CurrentVersion)"
+    } else {
+        Log "WARNING: proxy did not become healthy in time - failing open to upstream"
+    }
+}
+
+# 4) 写 settings.json:健康才指向代理;否则 fail-open 放行到真上游(绝不连累 CC)。
 try {
     if (Test-Path $SettingsFile) {
         $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
     } else {
         $settings = [PSCustomObject]@{}
     }
-
-    # Ensure env object exists
     if (-not ($settings | Get-Member -Name "env" -MemberType NoteProperty)) {
         $settings | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{})
     }
 
-    if ($HasConfigUpstream) {
-        # 权威模式：上游来自 rolling-context.json（server.py 直接读），这里只强制把 claude 指向本地代理。
-        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-        Log "Authoritative: ANTHROPIC_BASE_URL=$ProxyUrl upstream=$($Cfg.upstream) (config)"
+    if ($proxyHealthy) {
+        if ($HasConfigUpstream) {
+            # 权威模式:上游来自 config（server.py 直接读），这里只把 claude 指向本地代理。
+            $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
+            Log "BASE_URL=$ProxyUrl upstream=$($Cfg.upstream) (config)"
+        } else {
+            $existingUrl = $null
+            if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
+                $existingUrl = $settings.env.ANTHROPIC_BASE_URL
+            }
+            if ($existingUrl -and ($existingUrl -notmatch "127\.0\.0\.1.*$Port")) {
+                # 链上已有真上游 → 存起来给 server.py 用,再把 claude 指向代理。
+                $settings.env | Add-Member -NotePropertyName "ROLLING_CONTEXT_UPSTREAM" -NotePropertyValue $existingUrl -Force
+                Log "Chaining upstream=$existingUrl"
+            }
+            $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
+            # 仅无 config 时写 env 默认(有 config 时由 server.py 从 config 读,不污染 settings.json)。
+            $defaults = @{
+                "ROLLING_CONTEXT_PORT"    = "5588"
+                "ROLLING_CONTEXT_TRIGGER" = "160000"
+                "ROLLING_CONTEXT_TARGET"  = "40000"
+                "ROLLING_CONTEXT_MODEL"   = "claude-haiku-4-5-20251001"
+            }
+            foreach ($key in $defaults.Keys) {
+                if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {
+                    $settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key]
+                }
+            }
+        }
     } else {
+        # FAIL-OPEN:代理没起来 → 把 BASE_URL 指回真上游(或移除回落官方 API),让 CC 照常工作。
+        $failTarget = $null
+        if ($HasConfigUpstream) {
+            $failTarget = $Cfg.upstream
+        } elseif ($settings.env | Get-Member -Name "ROLLING_CONTEXT_UPSTREAM" -MemberType NoteProperty) {
+            $failTarget = $settings.env.ROLLING_CONTEXT_UPSTREAM
+        }
         $existingUrl = $null
         if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
             $existingUrl = $settings.env.ANTHROPIC_BASE_URL
         }
-        if (-not $existingUrl) {
-            $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-            Log "Set ANTHROPIC_BASE_URL=$ProxyUrl (settings.json)"
-        } elseif ($existingUrl -notmatch "127\.0\.0\.1.*$Port") {
-            $settings.env | Add-Member -NotePropertyName "ROLLING_CONTEXT_UPSTREAM" -NotePropertyValue $existingUrl -Force
-            $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-            Log "Chaining: upstream=$existingUrl (settings.json)"
+        if ($failTarget) {
+            $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $failTarget -Force
+            Log "FAIL-OPEN: ANTHROPIC_BASE_URL=$failTarget (proxy down)"
+        } elseif ($existingUrl -and ($existingUrl -match "127\.0\.0\.1.*$Port")) {
+            # 之前指着代理、又没有已知真上游 → 移除,回落官方 API,绝不把 CC 卡死在死代理上。
+            $settings.env.PSObject.Properties.Remove("ANTHROPIC_BASE_URL")
+            Log "FAIL-OPEN: removed ANTHROPIC_BASE_URL -> default API (proxy down, no known upstream)"
         } else {
-            Log "ANTHROPIC_BASE_URL already set (settings.json)"
-        }
-
-        # 仅无 config 时写 env 默认（有 config 时由 server.py 从 config 读，不污染 settings.json）。
-        $defaults = @{
-            "ROLLING_CONTEXT_PORT"    = "5588"
-            "ROLLING_CONTEXT_TRIGGER" = "160000"
-            "ROLLING_CONTEXT_TARGET"  = "40000"
-            "ROLLING_CONTEXT_MODEL"   = "claude-haiku-4-5-20251001"
-        }
-        foreach ($key in $defaults.Keys) {
-            if (-not ($settings.env | Get-Member -Name $key -MemberType NoteProperty)) {
-                $settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $defaults[$key]
-            }
+            Log "FAIL-OPEN: leaving ANTHROPIC_BASE_URL as-is (proxy down)"
         }
     }
 
-    # 写 UTF8 无 BOM：PS5.1 的 Set-Content -Encoding UTF8 会带 BOM，
+    # 写 UTF8 无 BOM：PS5.1 的 Set-Content -Encoding UTF8 会带 BOM,
     # 导致代理(server.py)用 utf-8 读 settings.json 解析失败、退回默认上游。
     $json = $settings | ConvertTo-Json -Depth 10
     [System.IO.File]::WriteAllText($SettingsFile, $json, (New-Object System.Text.UTF8Encoding($false)))
 } catch {
     Log "WARNING: Could not update settings.json: $_"
 }
-
-# Check if proxy is already running
-if (Test-Path $PidFile) {
-    $savedPid = Get-Content $PidFile -ErrorAction SilentlyContinue
-    if ($savedPid) {
-        $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
-        if ($proc) {
-            # 版本闸门:同版本复用;在跑的版本 >= 本会话版本则复用(绝不降级);
-            # 仅当本会话版本严格更高才重启升级。根治多版本会话把 5588 共享代理来回拽、
-            # 每次重启掐断在传请求 + 清空压缩状态的「版本互踢」。
-            $runningVersion = "$(if (Test-Path $VerFile) { Get-Content $VerFile -ErrorAction SilentlyContinue } else { '' })".Trim()
-            if ($runningVersion -eq $CurrentVersion) {
-                Log "Proxy already running (PID $savedPid, v$runningVersion)"
-                exit 0
-            }
-            $isUpgrade = $true   # 版本号无法比较时(缺失/unknown)按旧行为重启升级
-            try {
-                if ($runningVersion -and $CurrentVersion -and $CurrentVersion -ne 'unknown') {
-                    $isUpgrade = ([version]$CurrentVersion).CompareTo([version]$runningVersion) -gt 0
-                }
-            } catch { $isUpgrade = $true }
-            if (-not $isUpgrade) {
-                Log "Proxy running newer/equal (PID $savedPid, v$runningVersion >= v$CurrentVersion) - reusing, no downgrade"
-                exit 0
-            }
-            Log "Upgrading proxy ($runningVersion -> $CurrentVersion), restarting proxy (PID $savedPid)"
-            Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 1
-        }
-    }
-    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
-    Remove-Item $VerFile -Force -ErrorAction SilentlyContinue
-}
-
-# 兜底去重:无论 PidFile 是否准确,起新代理前先清掉任何仍在监听本端口的残留进程,
-# 根治「PidFile 被污染(如手动跑过 .sh 记成包装层 PID)→ 旧代理没杀掉 + 起新的 → 双实例抢端口」。
-# 注:同版本健康代理已在上面的 PidFile 检查里 exit 0,走不到这里,不会误杀健康实例。
-try {
-    $listeners = Get-NetTCPConnection -State Listen -LocalPort ([int]$Port) -ErrorAction SilentlyContinue
-    $killed = $false
-    foreach ($conn in $listeners) {
-        $opid = $conn.OwningProcess
-        if ($opid -and $opid -ne 0) {
-            Log "Killing stale listener on port $Port (PID $opid)"
-            Stop-Process -Id $opid -Force -ErrorAction SilentlyContinue
-            $killed = $true
-        }
-    }
-    if ($killed) { Start-Sleep -Milliseconds 500 }
-} catch {
-    Log "Port cleanup skipped: $_"
-}
-
-# Start proxy directly with system python — no venv needed
-Log "Starting proxy..."
-$proc = Start-Process -FilePath "python" -ArgumentList "server.py" `
-    -WorkingDirectory $ProxyDir `
-    -RedirectStandardOutput $ProxyLog -RedirectStandardError "$ProxyLog.err" `
-    -WindowStyle Hidden -PassThru
-$proc.Id | Out-File -FilePath $PidFile -NoNewline
-$CurrentVersion | Out-File -FilePath $VerFile -NoNewline
-Log "Proxy started with PID $($proc.Id) (v$CurrentVersion)"
 
 exit 0
