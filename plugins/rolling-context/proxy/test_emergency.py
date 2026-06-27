@@ -97,5 +97,82 @@ class CompressionKeyHashes(unittest.TestCase):
         self.assertEqual(key_hashes, server._hash_messages(src[2:6]))
 
 
+class StorePersistence(unittest.TestCase):
+    """Persisted store survives a restart → warm on boot → no cold full-history send."""
+
+    def setUp(self):
+        # per-test store file so cases don't bleed into each other
+        self._fd, self._path = tempfile.mkstemp(prefix="rc-store-", suffix=".json")
+        os.close(self._fd)
+        os.remove(self._path)  # start absent; _load must treat missing as empty
+        self._orig = server.STORE_FILE
+        server.STORE_FILE = self._path
+
+    def tearDown(self):
+        server.STORE_FILE = self._orig
+        for p in (self._path, self._path + ".tmp"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def _seed(self, store, hashes, prefix_text="SUMMARY", used=True, pre=123):
+        e = store.add()
+        e["original_hashes"] = list(hashes)
+        e["prefix"] = [{"role": "user", "content": prefix_text}]
+        e["used"] = used
+        e["pre_tokens"] = pre
+        return e
+
+    def test_missing_file_loads_empty(self):
+        s = server.CompressionStore()
+        self.assertEqual(s.compressions, [])
+
+    def test_roundtrip_then_match_after_reload(self):
+        s1 = server.CompressionStore()
+        self._seed(s1, ["aaa", "bbb"], pre=4096)
+        s1.persist()
+        # fresh instance = a "restarted proxy" reading the same file
+        s2 = server.CompressionStore()
+        self.assertEqual(len(s2.compressions), 1)
+        match, end = s2.find_match(["x", "aaa", "bbb", "y"])
+        self.assertIsNotNone(match, "reloaded entry must match its hash chain")
+        self.assertEqual(end, 3)
+        self.assertEqual(match["prefix"], [{"role": "user", "content": "SUMMARY"}])
+        self.assertEqual(match["pre_tokens"], 4096)
+        # runtime-only fields must be re-initialized, not loaded
+        self.assertIsNone(match["pending"])
+        self.assertIsNone(match["thread"])
+
+    def test_incomplete_entries_are_not_persisted(self):
+        s1 = server.CompressionStore()
+        s1.add()  # empty: no prefix, no hashes
+        self._seed(s1, ["only", "this"])  # complete
+        s1.persist()
+        s2 = server.CompressionStore()
+        self.assertEqual(len(s2.compressions), 1, "only complete entries survive a reload")
+
+    def test_prune_keeps_most_recent(self):
+        s1 = server.CompressionStore()
+        total = server.STORE_MAX_ENTRIES + 10
+        for i in range(total):
+            self._seed(s1, [f"h{i}"], prefix_text=f"S{i}")
+        s1.persist()
+        s2 = server.CompressionStore()
+        self.assertEqual(len(s2.compressions), server.STORE_MAX_ENTRIES)
+        # the LAST one in must survive (latest compression covers the most history)
+        last = s2.find_match([f"h{total - 1}"])
+        self.assertIsNotNone(last[0], "most recent entry must be retained after prune")
+        # the FIRST one in must have been dropped
+        first = s2.find_match(["h0"])
+        self.assertIsNone(first[0], "oldest entry must be pruned")
+
+    def test_corrupt_file_loads_empty(self):
+        with open(self._path, "w", encoding="utf-8") as f:
+            f.write("{ this is not valid json")
+        s = server.CompressionStore()  # must not raise
+        self.assertEqual(s.compressions, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -342,17 +342,78 @@ def _remark_cache_breakpoints(msgs: list):
         _mark_cache_breakpoint(msgs[-1])
 
 
+# 压缩成果落盘:store 原本只在内存,代理一重启(版本闸门/refresh/重启/崩溃自拉)或新开
+# --resume 长会话时 store 为空 → 第一发裸转全量历史(异步压缩只能为「下一发」备料,救不了「这一发」)。
+# 持久化后,重启/恢复时 store 是热的,长会话首发直接命中、不再满历史发送。
+STORE_FILE = os.path.join(_CLAUDE_DIR, "rolling-context-store.json")
+STORE_MAX_ENTRIES = 40  # 落盘保留的最近压缩条数上限,防止文件无界增长(越晚的条目覆盖历史越多)
+
+
 class CompressionStore:
     """Content-based compression tracking. No sessions, no fingerprints, no keys.
 
     Stores a list of compressions. Each has original_hashes (what was compressed)
     and prefix (the replacement). On ANY request, scans messages — if the hashes
     match a stored compression, replaces them with the prefix.
+
+    成果落盘:可用条目(有 prefix + 哈希链)持久化到 STORE_FILE,重启/恢复后加载回来,
+    消除冷启动时的满历史发送。内容哈希自校验 → 陈旧条目滑不中就是不被使用,绝不注入错的。
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._compressions = []  # list of compression entries
+        self._load()
+
+    def _load(self):
+        """启动时从盘加载已落盘的可用压缩条目。文件缺失/损坏一律当空开始(失败开放,绝不挡启动)。"""
+        try:
+            with open(STORE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            log.warning(f"[STORE] Could not load persisted store ({e}); starting empty")
+            return
+        n = 0
+        for d in (data.get("entries") or []):
+            oh = d.get("original_hashes") or []
+            prefix = d.get("prefix")
+            if not oh or not prefix:
+                continue  # 只收完整可用的条目;残缺的丢弃
+            self._compressions.append({
+                "original_hashes": oh,
+                "prefix": prefix,
+                "pending": None,
+                "pending_hashes": None,
+                "thread": None,
+                "used": bool(d.get("used", True)),
+                "pre_tokens": int(d.get("pre_tokens", 0) or 0),
+            })
+            n += 1
+        if n:
+            log.info(f"[STORE] Loaded {n} persisted compression(s) from {STORE_FILE}")
+
+    def persist(self):
+        """把当前可用条目原子写盘(临时文件 + os.replace,防崩溃半写)。
+        只存 prefix + 哈希链 + used/pre_tokens;pending/thread/_debug_messages 是运行期状态,不落盘。"""
+        with self._lock:
+            usable = [e for e in self._compressions
+                      if e.get("prefix") and e.get("original_hashes")][-STORE_MAX_ENTRIES:]
+            entries = [{
+                "original_hashes": e["original_hashes"],
+                "prefix": e["prefix"],
+                "used": e.get("used", True),
+                "pre_tokens": e.get("pre_tokens", 0),
+            } for e in usable]
+        try:
+            os.makedirs(_CLAUDE_DIR, exist_ok=True)
+            tmp = STORE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "entries": entries}, f, ensure_ascii=False)
+            os.replace(tmp, STORE_FILE)
+        except Exception as e:
+            log.warning(f"[STORE] Could not persist store: {e}")
 
     def find_match(self, msg_hashes: list, messages: list = None):
         """Find a compression whose hash chain appears in msg_hashes.
@@ -642,6 +703,7 @@ def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg
     entry["_debug_messages"] = summarized
     entry["used"] = True          # 已当场用上,不再标「首次注入」
     entry["pre_tokens"] = real or 0
+    store.persist()  # 同步兜底产出的条目也落盘,重启后仍可命中
     log.info(
         f"[EMG] Synchronous compression done: {len(messages)} -> {len(compressed)} messages "
         f"({compressor._count_chars(compressed):,} chars, key={len(key_hashes)} hashes); "
@@ -935,16 +997,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             log.debug(f"[MSG] breakdown failed: {e}")
 
         # Promote any pending compressions
+        promoted_any = False
         for entry in store.compressions:
             if entry["pending"] is not None:
                 entry["prefix"] = entry["pending"]
                 entry["original_hashes"] = entry["pending_hashes"]
                 entry["pending"] = None
                 entry["pending_hashes"] = None
+                promoted_any = True
                 log.info(
                     f"[MSG] Compression promoted: {len(entry['prefix'])} prefix messages "
                     f"replacing {len(entry['original_hashes'])} originals"
                 )
+        if promoted_any:
+            store.persist()  # 后台压缩转正即落盘,重启后免冷启动满历史发送
 
         # Scan: do any stored compressions match this request's messages?
         match, match_end = store.find_match(msg_hashes, messages)
