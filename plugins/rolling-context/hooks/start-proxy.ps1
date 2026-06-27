@@ -88,13 +88,25 @@ if (Test-Path $PidFile) {
     if ($savedPid) {
         $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
         if ($proc) {
-            # Check if version changed — restart if so
-            $runningVersion = if (Test-Path $VerFile) { Get-Content $VerFile -ErrorAction SilentlyContinue } else { "" }
+            # 版本闸门:同版本复用;在跑的版本 >= 本会话版本则复用(绝不降级);
+            # 仅当本会话版本严格更高才重启升级。根治多版本会话把 5588 共享代理来回拽、
+            # 每次重启掐断在传请求 + 清空压缩状态的「版本互踢」。
+            $runningVersion = "$(if (Test-Path $VerFile) { Get-Content $VerFile -ErrorAction SilentlyContinue } else { '' })".Trim()
             if ($runningVersion -eq $CurrentVersion) {
                 Log "Proxy already running (PID $savedPid, v$runningVersion)"
                 exit 0
             }
-            Log "Version changed ($runningVersion -> $CurrentVersion), restarting proxy (PID $savedPid)"
+            $isUpgrade = $true   # 版本号无法比较时(缺失/unknown)按旧行为重启升级
+            try {
+                if ($runningVersion -and $CurrentVersion -and $CurrentVersion -ne 'unknown') {
+                    $isUpgrade = ([version]$CurrentVersion).CompareTo([version]$runningVersion) -gt 0
+                }
+            } catch { $isUpgrade = $true }
+            if (-not $isUpgrade) {
+                Log "Proxy running newer/equal (PID $savedPid, v$runningVersion >= v$CurrentVersion) - reusing, no downgrade"
+                exit 0
+            }
+            Log "Upgrading proxy ($runningVersion -> $CurrentVersion), restarting proxy (PID $savedPid)"
             Stop-Process -Id $savedPid -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 1
         }

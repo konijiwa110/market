@@ -140,13 +140,21 @@ _pid_alive() {
 if [ -f "$PIDFILE" ]; then
     PID=$(cat "$PIDFILE")
     if _pid_alive "$PID"; then
-        # Check if version changed — restart if so
+        # 版本闸门:同版本复用;在跑的版本 >= 本会话版本则复用(绝不降级);
+        # 仅当本会话版本严格更高才重启升级。根治多版本会话把 5588 共享代理来回拽、
+        # 每次重启掐断在传请求 + 清空压缩状态的「版本互踢」。
         RUNNING_VERSION=$(cat "$VERFILE" 2>/dev/null)
         if [ "$CURRENT_VERSION" = "$RUNNING_VERSION" ]; then
             log "Proxy already running (PID $PID, v$RUNNING_VERSION)"
             exit 0
         fi
-        log "Version changed ($RUNNING_VERSION -> $CURRENT_VERSION), restarting proxy (PID $PID)"
+        # sort -V 版本排序:取两者较大者。RUNNING 较大(>=)=> 复用,不降级。
+        HIGHER=$(printf '%s\n%s\n' "$CURRENT_VERSION" "$RUNNING_VERSION" | sort -V | tail -1)
+        if [ -n "$RUNNING_VERSION" ] && [ "$HIGHER" = "$RUNNING_VERSION" ]; then
+            log "Proxy running newer/equal (PID $PID, v$RUNNING_VERSION >= v$CURRENT_VERSION) - reusing, no downgrade"
+            exit 0
+        fi
+        log "Upgrading proxy ($RUNNING_VERSION -> $CURRENT_VERSION), restarting proxy (PID $PID)"
         _kill_pid "$PID"
     fi
     rm -f "$PIDFILE" "$VERFILE"
