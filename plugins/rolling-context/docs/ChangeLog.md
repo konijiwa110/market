@@ -1,5 +1,33 @@
 # ChangeLog
 
+## 1.9.1 — 堵掉 1.9.0 的升级假成功:启动后校验「起来的确实是本版本」+ 占位者腾位 + 冒烟测试
+
+### 背景(1.9.0 自查发现的真洞)
+1.9.0 的启动轮询是 `if (Get-Health) { 成功 }`——只要端口上有**任一**健康代理应答就当自己起好了。坑在
+**绑定即锁**这条新路径上:旧/异版本代理仍占着 5588 时,本会话起的新 `server.py` 撞 `EADDRINUSE`
+干净退出,轮询却探到那个**老代理**在答 /health,于是日志谎报 `Proxy is up (v1.9.0)`、实际跑的还是老版本。
+对真实用户最致命的一幕:老代理 /health **不报 pid**(pre-1.9.0)、而 pidfile 又恰好不准(git-bash 下
+`$!` 记成包装层 PID 的老坑)时,没有任何手段腾出端口——升级**永远静默失败**且每次都谎报成功。1.9.0 为避开
+旧版「杀端口」竞态而删掉了 kill-by-port,反把这条一次性迁移路径的兜底也删没了。
+
+### 变更
+- `hooks/start-proxy.{ps1,sh}`:启动后轮询改为**校验版本**——只有 `/health` 报的 version **等于本会话
+  版本**才算成功。若探到健康代理但版本不符 = **占位者**(老代理赖着端口),仅凭这一「确证版本不符」的证据
+  作**最后手段**杀端口腾位(`Stop-PortHolder`/`_free_port`:先按 /health pid,再兜底杀端口监听者),
+  **再起一发**;最多两发,腾不动则 fail-open。**只在确证版本不符时才杀端口**,稳态复用根本走不到这一步,
+  不会误杀健康实例;两个新版本并发也收敛(高版本赢,闸门挡回踢)。
+- `proxy/server.py`:`_CLAUDE_DIR` 支持 `ROLLING_CONTEXT_STATE_DIR` 覆盖,让冒烟测试把 pidfile/version
+  写到 tmp 目录、不污染用户真实 ~/.claude(否则跑测试就把活着的 5588 网关记号冲掉)。
+- `proxy/test_lifecycle.py`(新增,stdlib `unittest`、隔离端口+状态目录、不碰 5588):断言 ① /health 的
+  version 来自 plugin.json、pid 是真实监听者;② 自写 pidfile == 该 pid;③ 绑定即锁——第二实例 exit 0、
+  首实例仍独占端口。`python -m unittest test_lifecycle` 一条命令复跑。这是这套生命周期**首个自动化回归**,
+  专挡上面这类「轮询/PID/双绑」回归。
+
+### 实测(2026-06-27)
+起 stub 老代理(/health 只回 `{"status":"ok"}`、无 version/pid)占住测试端口,隔离 USERPROFILE 跑真 hook:
+日志依次 `attempt 1` → `Port held by v (PID ) != v1.9.1 - freeing, retrying` → `attempt 2` →
+`Proxy is up`,/health 随后报真实版本——占位者被正确驱逐、不再谎报。冒烟测试 2 例全绿。
+
 ## 1.9.0 — 网关生命周期改「健康自识别 + 失败开放」:从 cache 跑、绑定即锁、代理挂了也不挡 CC
 
 ### 背景(取代 1.8.2 的「从 marketplace clone 跑」模型)

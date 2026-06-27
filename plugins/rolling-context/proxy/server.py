@@ -125,7 +125,9 @@ def _plugin_version() -> str:
 
 
 VERSION = _plugin_version()
-_CLAUDE_DIR = os.path.join(os.path.expanduser("~"), ".claude")
+# 状态目录默认 ~/.claude;可用 ROLLING_CONTEXT_STATE_DIR 覆盖,让冒烟测试写到 tmp 目录、
+# 不污染用户真实 pidfile/version(否则跑一遍测试就把活着的 5588 网关记号冲掉)。
+_CLAUDE_DIR = os.environ.get("ROLLING_CONTEXT_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
 PID_FILE = os.path.join(_CLAUDE_DIR, "rolling-context-proxy.pid")
 VER_FILE = os.path.join(_CLAUDE_DIR, "rolling-context-proxy.version")
 

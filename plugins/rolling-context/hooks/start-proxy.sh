@@ -94,6 +94,20 @@ _pid_alive() {
     fi
 }
 
+# 腾位:杀掉占着本端口的代理(先按 /health 自报 pid,再兜底杀端口上任何监听者)。
+# 仅在「确证错版本代理占着端口」时作最后手段调用——稳态复用走不到这一步,不会误杀健康实例。
+_free_port() {
+    _kill_pid "$1"
+    if [ "$IS_WINDOWS" = true ]; then
+        powershell.exe -Command "Get-NetTCPConnection -State Listen -LocalPort $PORT -ErrorAction SilentlyContinue | ForEach-Object { if (\$_.OwningProcess -and \$_.OwningProcess -ne 0) { Stop-Process -Id \$_.OwningProcess -Force -ErrorAction SilentlyContinue } }" 2>/dev/null
+    elif command -v lsof &>/dev/null; then
+        lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null | while read -r p; do kill -9 "$p" 2>/dev/null; done
+    elif command -v fuser &>/dev/null; then
+        fuser -k "$PORT/tcp" 2>/dev/null
+    fi
+    sleep 0.5
+}
+
 log "Hook started. PROXY_DIR=$PROXY_DIR v$CURRENT_VERSION IS_WINDOWS=$IS_WINDOWS$([ -n "$ROLLING_CONTEXT_DEV" ] && echo ' [DEV]')"
 
 # 2) 判活 + 升级闸门:
@@ -131,23 +145,49 @@ if [ "$PROXY_HEALTHY" != true ]; then
             sleep 1
         fi
     fi
-    log "Starting proxy from $PROXY_DIR ..."
-    # server.py 绑定成功后自写 pidfile/version 并答 /health。绑定即锁:并发起的第二个会
-    # EADDRINUSE 后干净退出,不会双实例。这里不再杀端口、不再猜 PID。
-    (
-        cd "$PROXY_DIR" || { log "ERROR: cannot cd to $PROXY_DIR"; exit 1; }
-        if [ "$IS_WINDOWS" = true ]; then
-            PYTHON_CMD="python"
-        elif command -v python3 &>/dev/null; then
-            PYTHON_CMD="python3"
+    _spawn_proxy() {
+        (
+            cd "$PROXY_DIR" || { log "ERROR: cannot cd to $PROXY_DIR"; exit 1; }
+            if [ "$IS_WINDOWS" = true ]; then
+                PYTHON_CMD="python"
+            elif command -v python3 &>/dev/null; then
+                PYTHON_CMD="python3"
+            else
+                PYTHON_CMD="python"
+            fi
+            nohup $PYTHON_CMD server.py > "$HOME/.claude/rolling-context-proxy.log" 2>&1 &
+        ) &
+    }
+    # server.py 绑定成功后自写 pidfile/version 并答 /health。绑定即锁:并发第二个会 EADDRINUSE 干净退。
+    # 轮询要确认「起来的确实是本版本」:旧/异版本代理赖着端口时 /health 会答别的 version → 仅凭此证据
+    # 作最后手段杀端口腾位、再起一发(最多两发,腾不动则 fail-open)。根治「见任一健康代理就谎报已升级」。
+    for attempt in 1 2; do
+        log "Starting proxy from $PROXY_DIR ... (attempt $attempt)"
+        _spawn_proxy
+        GOT_SQUATTER=false
+        SQUATTER_VER=""
+        SQUATTER_PID=""
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 0.5
+            H=$(proxy_health)
+            [ -z "$H" ] && continue
+            HV=$(printf '%s' "$H" | cut -f1)
+            if [ "$HV" = "$CURRENT_VERSION" ]; then
+                PROXY_HEALTHY=true
+                break
+            fi
+            GOT_SQUATTER=true
+            SQUATTER_VER="$HV"
+            SQUATTER_PID=$(printf '%s' "$H" | cut -f2)
+            break
+        done
+        [ "$PROXY_HEALTHY" = true ] && break
+        if [ "$GOT_SQUATTER" = true ]; then
+            log "Port $PORT held by v${SQUATTER_VER:-?} (PID ${SQUATTER_PID:-?}) != v$CURRENT_VERSION - freeing, retrying"
+            _free_port "$SQUATTER_PID"
         else
-            PYTHON_CMD="python"
+            break
         fi
-        nohup $PYTHON_CMD server.py > "$HOME/.claude/rolling-context-proxy.log" 2>&1 &
-    ) &
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        sleep 0.5
-        [ -n "$(proxy_health)" ] && { PROXY_HEALTHY=true; break; }
     done
     if [ "$PROXY_HEALTHY" = true ]; then
         log "Proxy is up (v$CURRENT_VERSION)"

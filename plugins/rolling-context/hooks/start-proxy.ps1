@@ -48,6 +48,21 @@ function Get-Health {
     }
 }
 
+# 腾位:杀掉占着本端口的代理(先按 /health 自报的 pid,再兜底杀端口上任何残留监听者)。
+# 仅在「确证有错版本代理占着端口」时作最后手段调用——稳态复用根本走不到这一步,不会误杀健康实例。
+function Stop-PortHolder($holderPid) {
+    if ($holderPid) { Stop-Process -Id ([int]$holderPid) -Force -ErrorAction SilentlyContinue }
+    try {
+        Get-NetTCPConnection -State Listen -LocalPort ([int]$Port) -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                if ($_.OwningProcess -and $_.OwningProcess -ne 0) {
+                    Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+                }
+            }
+    } catch {}
+    Start-Sleep -Milliseconds 500
+}
+
 Log "Hook started. ProxyDir=$ProxyDir v$CurrentVersion$(if ($DevRoot) { ' [DEV]' })"
 
 # 2) 判活 + 升级闸门:
@@ -83,16 +98,32 @@ if (-not $proxyHealthy) {
             Start-Sleep -Milliseconds 500
         }
     }
-    Log "Starting proxy from $ProxyDir ..."
     # server.py 绑定成功后自写 pidfile/version 并答 /health。绑定即锁:若并发起了第二个,
-    # 它会 EADDRINUSE 后干净 exit 0,不会双实例。这里不再杀端口、不再猜 PID。
-    Start-Process -FilePath "python" -ArgumentList "server.py" `
-        -WorkingDirectory $ProxyDir `
-        -RedirectStandardOutput $ProxyLog -RedirectStandardError "$ProxyLog.err" `
-        -WindowStyle Hidden | Out-Null
-    for ($i = 0; $i -lt 10; $i++) {
-        Start-Sleep -Milliseconds 500
-        if (Get-Health) { $proxyHealthy = $true; break }
+    # 它会 EADDRINUSE 后干净 exit 0,不会双实例。
+    # 关键:轮询要确认「起来的确实是本版本」——若旧/异版本代理还占着端口(绑定即锁让我们这发干净退了),
+    # /health 会答出别的 version。仅凭这一「确证版本不符」的证据才作最后手段杀端口腾位、再起一发;
+    # 最多两发,腾不动就 fail-open。根治原先「轮询见任一健康代理就当成功」→ 老代理赖着端口、却谎报已升级。
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        Log "Starting proxy from $ProxyDir ... (attempt $attempt)"
+        Start-Process -FilePath "python" -ArgumentList "server.py" `
+            -WorkingDirectory $ProxyDir `
+            -RedirectStandardOutput $ProxyLog -RedirectStandardError "$ProxyLog.err" `
+            -WindowStyle Hidden | Out-Null
+        $squatter = $null
+        for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Milliseconds 500
+            $h = Get-Health
+            if (-not $h) { continue }
+            if ("$($h.version)".Trim() -eq $CurrentVersion) { $proxyHealthy = $true; break }
+            $squatter = $h; break   # 有健康代理在答,但版本不是我们 → 占位者
+        }
+        if ($proxyHealthy) { break }
+        if ($squatter) {
+            Log "Port $Port held by v$("$($squatter.version)".Trim()) (PID $($squatter.pid)) != v$CurrentVersion - freeing, retrying"
+            Stop-PortHolder $squatter.pid
+        } else {
+            break   # 没人应答 = 真没起来(非占位),别再空转杀端口
+        }
     }
     if ($proxyHealthy) {
         Log "Proxy is up (v$CurrentVersion)"
