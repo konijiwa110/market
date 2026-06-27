@@ -16,16 +16,20 @@ import hashlib
 import json
 import os
 import sys
+import time
 import logging
+import logging.handlers
 import threading
 import ssl
 import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from compressor import RollingCompressor
+from stats import StatsCollector
 
-class FlushFileHandler(logging.FileHandler):
+class FlushFileHandler(logging.handlers.RotatingFileHandler):
+    """每条日志即时 flush 落盘;按大小滚动,封顶总占用,避免长期运行把磁盘写爆。"""
     def emit(self, record):
         super().emit(record)
         self.flush()
@@ -57,12 +61,21 @@ _LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(sess)s|t%(tid)05d] %(message)s"
 _sess_filter = _SessionFilter()
 
 _log_path = os.path.join(os.path.expanduser("~"), ".claude", "rolling-context-debug.log")
-_log_handler = FlushFileHandler(_log_path, mode="a")
+# 日志滚动:单文件最多 10MB,保留 5 个历史(rolling-context-debug.log.1..5),总占用 ≈60MB 封顶,
+# 防止长期运行把磁盘写爆。可用环境变量覆写(ROLLING_CONTEXT_LOG_MB / _LOG_BACKUPS)。
+_LOG_MAX_BYTES = int(os.environ.get("ROLLING_CONTEXT_LOG_MB", "10")) * 1024 * 1024
+_LOG_BACKUPS = int(os.environ.get("ROLLING_CONTEXT_LOG_BACKUPS", "5"))
+_log_handler = FlushFileHandler(
+    _log_path, mode="a", maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUPS, encoding="utf-8",
+)
 _log_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
 _log_handler.addFilter(_sess_filter)
+# stdout(被 start-proxy 重定向到 rolling-context-proxy.log)只收 INFO+,体量约为 DEBUG 的十分之一;
+# 完整 DEBUG 仍写入上面会滚动的 debug.log。两边都不再无界增长。
 _stream_handler = logging.StreamHandler(sys.stdout)
 _stream_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
 _stream_handler.addFilter(_sess_filter)
+_stream_handler.setLevel(logging.INFO)
 logging.basicConfig(
     level=logging.DEBUG,
     handlers=[_stream_handler, _log_handler],
@@ -327,6 +340,69 @@ class CompressionStore:
 
 store = CompressionStore()
 
+# 请求级统计采集器:每个真实 /v1/messages 生成调用记一条(token + 各类耗时),
+# 内存环形缓冲 + JSONL 落盘,供 /stats 看板读取。
+stats = StatsCollector()
+
+# 并发检测:保存「在途」生成请求的 record 引用。任意时刻在途 >1 个,即把彼此都标记
+# concurrent —— 这样并发期内每个请求都带标记,看板可把并发吞吐与单请求吞吐分开统计。
+_inflight_lock = threading.Lock()
+_inflight = []
+
+
+def _capture_error_source(record, resp, buffer):
+    """对 >=400 的响应记录来源指纹,判定错误是 Cloudflare 边缘还是上游(sub2api)origin 生成。
+
+    关键:sub2api 多半也挂在 Cloudflare 后面,因此 `Server: cloudflare` / `CF-RAY` 几乎所有响应
+    都带,不能据此判 CF。真正的判据是「谁生成了这个错误体」:
+      - Cloudflare 自身拦截:多为 text/html 错误页,或带 `cf-mitigated`;无源站 `Via` / `X-Request-Id`。
+      - 上游 origin(sub2api):JSON 错误体 + 源站标记(`Via: Caddy`、`X-Request-Id` 等),CF 仅透传。
+    原始指纹一并存库(err_*),前端可自行复核判定。
+    """
+    def h(name):
+        try:
+            return resp.getheader(name) or ""
+        except Exception:
+            return ""
+
+    ctype = h("content-type")
+    cf_ray = h("cf-ray")
+    cf_mit = h("cf-mitigated")
+    via = h("via")
+    xreq = h("x-request-id") or h("x-client-request-id")
+    snippet = ""
+    try:
+        snippet = buffer.decode("utf-8", "replace")[:500]
+    except Exception:
+        pass
+    low = (ctype + " " + snippet).lower()
+    is_html = "text/html" in ctype.lower()
+    if cf_mit or (is_html and ("cloudflare" in low or "attention required" in low or cf_ray)):
+        src = "cloudflare"
+    elif "json" in ctype.lower() or via or xreq:
+        src = "upstream"
+    elif cf_ray:
+        src = "cloudflare"
+    else:
+        src = "upstream"
+
+    record["err_source"] = src
+    record["err_server"] = h("server")
+    record["err_cf_ray"] = cf_ray
+    record["err_cf_mitigated"] = cf_mit
+    record["err_via"] = via
+    record["err_ctype"] = ctype
+    record["err_retry_after"] = h("retry-after")
+    record["err_snippet"] = snippet
+    log.warning(
+        f"[MSG] HTTP {resp.status} err_source={src} server={h('server')!r} "
+        f"cf_ray={cf_ray!r} cf_mitigated={cf_mit!r} via={via!r} ctype={ctype!r} "
+        f"retry_after={h('retry-after')!r} body={snippet!r}"
+    )
+
+# 看板 HTML 与 server.py 同目录;代理工作目录即 proxy/,但用 __file__ 定位更稳。
+DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -529,6 +605,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._handle_health()
         elif normalized_path == "/debug/compressions":
             self._handle_debug_compressions()
+        elif normalized_path in ("/stats", "/stats/"):
+            self._handle_stats_page()
+        elif normalized_path == "/stats/data":
+            self._handle_stats_data(parsed)
         else:
             self._proxy_raw("GET")
 
@@ -605,7 +685,72 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_stats_page(self):
+        """Serve the self-contained statistics dashboard (HTML)."""
+        try:
+            with open(DASHBOARD_HTML, "rb") as f:
+                body = f.read()
+            ctype = "text/html; charset=utf-8"
+        except Exception as e:
+            body = f"dashboard.html not found: {e}".encode()
+            ctype = "text/plain; charset=utf-8"
+            self.send_response(404)
+            self.send_header("content-type", ctype)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(200)
+        self.send_header("content-type", ctype)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_stats_data(self, parsed):
+        """Return aggregated statistics as JSON for the dashboard charts."""
+        qs = parse_qs(parsed.query)
+        hours_raw = (qs.get("hours", ["24"])[0] or "24").lower()
+        if hours_raw in ("all", "0", ""):
+            hours = None
+        else:
+            try:
+                hours = float(hours_raw)
+            except ValueError:
+                hours = 24.0
+        extra = {
+            "upstream_url": UPSTREAM_URL,
+            "summarizer_model": SUMMARIZER_MODEL,
+            "trigger_tokens": TRIGGER_TOKENS,
+            "target_tokens": TARGET_TOKENS,
+            "listen_port": LISTEN_PORT,
+            "compression_count": compressor.compression_count,
+            "total_tokens_saved": compressor.total_tokens_saved,
+        }
+        try:
+            data = stats.aggregate(hours=hours, now=time.time(), extra=extra)
+            body = json.dumps(data, ensure_ascii=False).encode()
+        except Exception as e:
+            log.error(f"[STATS] aggregate failed: {e}", exc_info=True)
+            body = json.dumps({"error": str(e)}).encode()
+            self.send_response(500)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(200)
+        self.send_header("content-type", "application/json; charset=utf-8")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_messages(self):
+        # 统计计时:t_recv=请求进入代理;ts_epoch=墙钟时间戳(供看板按时间分桶)。
+        # count_tokens 是 CC 频繁的「探测」调用、无生成,排除以免污染 token/延迟统计。
+        t_recv = time.perf_counter()
+        ts_epoch = time.time()
+        is_count = "count_tokens" in self.path
+
         raw_body = self._read_body()
         req_headers = self._get_headers_dict()
         auth_headers = get_passthrough_headers(req_headers)
@@ -731,9 +876,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         log.info(f"[MSG] Forwarding to {UPSTREAM_URL}{self.path} ({len(body):,} bytes)")
 
+        # 本次请求的统计记录,在 try 内逐步填充(token/状态/耗时),finally 落库一次。
+        record = {
+            "ts": ts_epoch, "model": model, "session": _get_sess(),
+            "stream": bool(is_streaming), "status": 0,
+            "input_tokens": 0, "cache_read": 0, "cache_create": 0, "output_tokens": 0,
+            "req_bytes": len(raw_body), "resp_bytes": 0, "injected": injected,
+            "t_overhead_ms": 0, "t_prefill_ms": 0, "t_gen_ms": 0, "t_total_ms": 0,
+            "concurrent": False, "stream_chunks": 0,
+        }
+        t_first = None
+        t_fwd = t_recv
+
+        # 注册在途(仅真实生成请求;count_tokens 探测不计入并发)。
+        if not is_count:
+            with _inflight_lock:
+                if _inflight:
+                    record["concurrent"] = True
+                    for r in _inflight:
+                        r["concurrent"] = True
+                _inflight.append(record)
+
         try:
             conn = _upstream_conn()
             upstream_full_path = _join_path(UPSTREAM_PATH, self.path)
+            t_fwd = time.perf_counter()  # 转发上游的时刻;首字延迟 = t_first - t_fwd
             conn.request("POST", upstream_full_path, body=body, headers=headers)
             resp = conn.getresponse()
 
@@ -760,20 +927,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             buffer = b""
             total_bytes = 0
             total_input = 0
+            chunks = 0  # 收到的数据块数:真流式应有几十~上百块;个位数=上游把整条流缓冲后一次性吐出
             while True:
                 # read1: 同上,逐 SSE 事件即时 flush,消除 8KB 批缓冲卡顿。
                 chunk = resp.read1(8192)
                 if not chunk:
                     break
+                if t_first is None:
+                    t_first = time.perf_counter()  # 首字到达:prefill(输入处理)结束、生成开始
+                chunks += 1
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 total_bytes += len(chunk)
-                if is_streaming:
+                # 正常流式响应要缓存以解析 usage;错误响应(任意 stream 取值)也缓存一小段,
+                # 用于判定来源(CF 还是上游)。错误体都很小,封顶 64KB 防御异常大包。
+                if is_streaming or (resp.status >= 400 and len(buffer) < 65536):
                     buffer += chunk
 
             log.info(f"[MSG] Done streaming {total_bytes:,} bytes")
 
-            # Extract input tokens from SSE stream
+            # 统一解析 usage:输入(新增/缓存读/缓存创建)与输出 token。
+            # input 主要来自 message_start;output 取各 message_delta 的累计最大值。
+            usage_info = {"input": 0, "cache_read": 0, "cache_create": 0, "output": 0}
             if is_streaming and buffer:
                 try:
                     text = buffer.decode("utf-8", errors="replace")
@@ -788,56 +963,67 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         except json.JSONDecodeError:
                             continue
                         evt_type = data.get("type", "")
-
-                        # Anthropic native: usage in message_start.message.usage
+                        # Anthropic 原生:usage 在 message_start.message.usage
                         if evt_type == "message_start":
-                            usage = data.get("message", {}).get("usage", {})
-                            cache_read = usage.get("cache_read_input_tokens", 0)
-                            cache_create = usage.get("cache_creation_input_tokens", 0)
-                            tokens = (
-                                usage.get("input_tokens", 0)
-                                + cache_create
-                                + cache_read
-                            )
-                            if tokens > 0:
-                                total_input = tokens
-                                log.info(
-                                    f"[MSG] Input tokens from message_start: {total_input:,} "
-                                    f"(cache_read={cache_read:,} cache_create={cache_create:,} "
-                                    f"input={usage.get('input_tokens', 0):,})"
-                                )
-
-                        # Proxy/converter: usage in message_delta.usage (e.g. CodeGate)
+                            u = data.get("message", {}).get("usage", {})
+                            if u.get("input_tokens"):
+                                usage_info["input"] = u.get("input_tokens", 0)
+                            if u.get("cache_read_input_tokens"):
+                                usage_info["cache_read"] = u.get("cache_read_input_tokens", 0)
+                            if u.get("cache_creation_input_tokens"):
+                                usage_info["cache_create"] = u.get("cache_creation_input_tokens", 0)
+                            if u.get("output_tokens"):
+                                usage_info["output"] = max(usage_info["output"], u.get("output_tokens", 0))
+                        # 末尾 message_delta 携带最终 output_tokens;部分中转网关也在此给 input。
                         elif evt_type == "message_delta":
-                            usage = data.get("usage", {})
-                            tokens = int(usage.get("input_tokens", 0))
-                            if tokens > 0 and tokens > total_input:
-                                total_input = tokens
-                                log.info(f"[MSG] Input tokens from message_delta: {total_input:,}")
-
-                    if total_input == 0:
-                        sse_lines = [l for l in text.split("\n") if l.startswith("data: ")]
-                        log.warning(
-                            f"[MSG] No input tokens found in SSE! "
-                            f"Total events: {len(sse_lines)}"
-                        )
+                            u = data.get("usage", {})
+                            if u.get("output_tokens"):
+                                usage_info["output"] = max(usage_info["output"], int(u.get("output_tokens", 0)))
+                            if u.get("input_tokens") and not usage_info["input"]:
+                                usage_info["input"] = int(u.get("input_tokens", 0))
                 except Exception as e:
-                    log.warning(f"[MSG] Failed to parse SSE for tokens: {e}")
+                    log.warning(f"[MSG] Failed to parse SSE for usage: {e}")
             elif not is_streaming and buffer:
                 try:
                     data = json.loads(buffer)
-                    usage = data.get("usage", {})
-                    total_input = (
-                        usage.get("input_tokens", 0)
-                        + usage.get("cache_creation_input_tokens", 0)
-                        + usage.get("cache_read_input_tokens", 0)
-                    )
-                    if total_input > 0:
-                        log.info(f"[MSG] Input tokens from response: {total_input:,}")
+                    u = data.get("usage", {})
+                    usage_info["input"] = u.get("input_tokens", 0)
+                    usage_info["cache_read"] = u.get("cache_read_input_tokens", 0)
+                    usage_info["cache_create"] = u.get("cache_creation_input_tokens", 0)
+                    usage_info["output"] = u.get("output_tokens", 0)
                 except Exception as e:
-                    log.warning(f"[MSG] Failed to parse response for tokens: {e}")
+                    log.warning(f"[MSG] Failed to parse response for usage: {e}")
+
+            total_input = usage_info["input"] + usage_info["cache_read"] + usage_info["cache_create"]
+            if total_input > 0:
+                log.info(
+                    f"[MSG] Usage: input={usage_info['input']:,} "
+                    f"cache_read={usage_info['cache_read']:,} cache_create={usage_info['cache_create']:,} "
+                    f"output={usage_info['output']:,} (billed_input={total_input:,})"
+                )
+            else:
+                log.warning("[MSG] No usage tokens found in response")
+
+            # 错误响应(>=400)记录来源指纹,判定是 Cloudflare 边缘还是上游(sub2api)origin 生成。
+            if resp.status >= 400:
+                _capture_error_source(record, resp, buffer)
 
             conn.close()
+
+            # 计时与 usage 落入统计记录(供 finally 落库)。
+            t_end = time.perf_counter()
+            record["status"] = resp.status
+            record["resp_bytes"] = total_bytes
+            record["stream_chunks"] = chunks
+            record["input_tokens"] = usage_info["input"]
+            record["cache_read"] = usage_info["cache_read"]
+            record["cache_create"] = usage_info["cache_create"]
+            record["output_tokens"] = usage_info["output"]
+            record["t_overhead_ms"] = round((t_fwd - t_recv) * 1000, 1)
+            if t_first is not None:
+                record["t_prefill_ms"] = round((t_first - t_fwd) * 1000, 1)
+                record["t_gen_ms"] = round((t_end - t_first) * 1000, 1)
+            record["t_total_ms"] = round((t_end - t_recv) * 1000, 1)
 
             # Fallback: estimate tokens from chars if SSE didn't provide usage
             if total_input == 0 and msg_chars > 0:
@@ -870,12 +1056,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         except Exception as e:
             log.error(f"[MSG] Upstream error: {e}", exc_info=True)
+            if record["status"] == 0:
+                record["status"] = 502
+            record["t_total_ms"] = round((time.perf_counter() - t_recv) * 1000, 1)
             error_body = json.dumps({"error": str(e)}).encode()
             self.send_response(502)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(error_body)))
             self.end_headers()
             self.wfile.write(error_body)
+        finally:
+            # 退出在途登记(并发检测),并落一条统计。count_tokens 探测两者都跳过。
+            if not is_count:
+                with _inflight_lock:
+                    try:
+                        _inflight.remove(record)
+                    except ValueError:
+                        pass
+                try:
+                    stats.record(record)
+                except Exception as ex:
+                    log.debug(f"[MSG] stats.record failed: {ex}")
 
 
 class ThreadedHTTPServer(HTTPServer):

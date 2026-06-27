@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rolling Context · 网关统计</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+        integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4"
+        crossorigin="anonymous"></script>
+<style>
+  body { background:#020617; }
+  .card { background:#0b1220; border:1px solid #1e293b; border-radius:14px; }
+  canvas { width:100% !important; }
+  ::-webkit-scrollbar { height:8px; width:8px; }
+  ::-webkit-scrollbar-thumb { background:#1e293b; border-radius:4px; }
+</style>
+</head>
+<body class="text-slate-200 font-sans antialiased">
+<div class="max-w-[1400px] mx-auto px-5 py-6">
+
+  <!-- Header -->
+  <header class="flex flex-wrap items-center justify-between gap-4 mb-6">
+    <div>
+      <h1 class="text-xl font-semibold tracking-tight">Rolling Context · 网关统计</h1>
+      <p id="config" class="text-xs text-slate-500 mt-1">加载中…</p>
+    </div>
+    <div class="flex items-center gap-2">
+      <div id="ranges" class="flex rounded-lg overflow-hidden border border-slate-700 text-sm"></div>
+      <button id="refreshBtn" class="px-3 py-1.5 rounded-lg border border-slate-700 text-sm hover:bg-slate-800 transition">刷新</button>
+      <label class="flex items-center gap-1.5 text-xs text-slate-400 select-none cursor-pointer">
+        <input id="autoChk" type="checkbox" checked class="accent-sky-500"> 自动
+      </label>
+    </div>
+  </header>
+
+  <p id="updated" class="text-xs text-slate-600 mb-4">—</p>
+
+  <!-- KPI cards -->
+  <section id="kpis" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-6"></section>
+
+  <!-- Charts -->
+  <section class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div class="card p-4"><h2 class="text-sm text-slate-400 mb-3">Token 用量(按时间)<span class="text-slate-600"> · 柱=输入分项,线=输出</span></h2><div class="h-64"><canvas id="cTokens"></canvas></div></div>
+    <div class="card p-4"><h2 class="text-sm text-slate-400 mb-3">请求数(按时间)</h2><div class="h-64"><canvas id="cReq"></canvas></div></div>
+    <div class="card p-4"><h2 class="text-sm text-slate-400 mb-3">响应时间拆解(按时间)<span class="text-slate-600"> · 首字 + 生成 = 总耗时</span></h2><div class="h-64"><canvas id="cLatTime"></canvas></div></div>
+    <div class="card p-4"><h2 class="text-sm text-slate-400 mb-3">延迟分位(ms)<span class="text-slate-600"> · 总 / 首字 / 生成</span></h2><div class="h-64"><canvas id="cLatPct"></canvas></div></div>
+    <div class="card p-4"><h2 class="text-sm text-slate-400 mb-3">输出吞吐(tokens/秒)<span class="text-slate-600"> · 单请求 vs 并发</span></h2><div class="h-64"><canvas id="cTps"></canvas></div></div>
+    <div class="card p-4"><h2 class="text-sm text-slate-400 mb-3">缓存命中率(%)</h2><div class="h-64"><canvas id="cCache"></canvas></div></div>
+    <div class="card p-4"><h2 class="text-sm text-slate-400 mb-3">按模型的 Token 占比</h2><div class="h-64"><canvas id="cModel"></canvas></div></div>
+    <div class="card p-4"><h2 class="text-sm text-slate-400 mb-3">按会话的 Token(Top 12)</h2><div class="h-64"><canvas id="cSession"></canvas></div></div>
+  </section>
+
+  <!-- Recent table -->
+  <section class="card p-4 mt-6">
+    <div class="flex flex-wrap items-center gap-3 mb-3">
+      <h2 class="text-sm text-slate-400">最近请求(最新 100 条)</h2>
+      <div class="flex items-center gap-2 ml-auto text-xs">
+        <select id="fModel" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-300">
+          <option value="">全部模型</option>
+        </select>
+        <select id="fSession" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-300">
+          <option value="">全部会话</option>
+        </select>
+        <span id="fCount" class="text-slate-600"></span>
+      </div>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead class="text-slate-500 border-b border-slate-800">
+          <tr class="text-left">
+            <th class="py-2 pr-3 font-medium">时间</th>
+            <th class="py-2 pr-3 font-medium">模型</th>
+            <th class="py-2 pr-3 font-medium">会话</th>
+            <th class="py-2 pr-3 font-medium text-right">输入</th>
+            <th class="py-2 pr-3 font-medium text-right">缓存读</th>
+            <th class="py-2 pr-3 font-medium text-right">输出</th>
+            <th class="py-2 pr-3 font-medium text-right">tok/s</th>
+            <th class="py-2 pr-3 font-medium text-right">首字</th>
+            <th class="py-2 pr-3 font-medium text-right">生成</th>
+            <th class="py-2 pr-3 font-medium text-right">总耗时</th>
+            <th class="py-2 pr-3 font-medium text-center">并发</th>
+            <th class="py-2 pr-3 font-medium text-center">压缩</th>
+            <th class="py-2 pr-3 font-medium text-right">状态</th>
+          </tr>
+        </thead>
+        <tbody id="recentBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="text-center text-xs text-slate-700 mt-8">Rolling Context Proxy · /stats</footer>
+</div>
+
+<script>
+// ---- 颜色(对齐 Tailwind 调色板) ----
+const C = {
+  sky:'#0ea5e9', cyan:'#22d3ee', violet:'#8b5cf6', amber:'#fbbf24',
+  emerald:'#10b981', rose:'#f43f5e', pink:'#ec4899', slate:'#64748b',
+  blue:'#3b82f6', indigo:'#6366f1', teal:'#14b8a6', orange:'#fb923c',
+};
+const PALETTE = [C.sky, C.violet, C.amber, C.emerald, C.rose, C.cyan, C.pink, C.indigo, C.orange, C.teal, C.blue, C.slate];
+
+// ---- Chart.js 暗色默认 ----
+Chart.defaults.color = '#94a3b8';
+Chart.defaults.borderColor = '#1e293b';
+Chart.defaults.font.size = 11;
+Chart.defaults.plugins.legend.labels.boxWidth = 12;
+Chart.defaults.plugins.legend.labels.boxHeight = 12;
+Chart.defaults.maintainAspectRatio = false;
+
+const charts = {};
+let state = { hours: '24' };
+
+// ---- 格式化 ----
+function fmt(n){
+  n = n || 0;
+  if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
+  if (n >= 1e6) return (n/1e6).toFixed(2)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1)+'k';
+  return Math.round(n).toString();
+}
+function fmtMs(ms){
+  ms = ms || 0;
+  if (ms >= 1000) return (ms/1000).toFixed(2)+'s';
+  return Math.round(ms)+'ms';
+}
+function fmtClock(epochSec){
+  const d = new Date(epochSec*1000);
+  return d.toLocaleString([], {month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false});
+}
+function tickLabel(epochSec, bucketSec){
+  const d = new Date(epochSec*1000);
+  const p = x => String(x).padStart(2,'0');
+  if (bucketSec >= 86400) return `${p(d.getMonth()+1)}/${p(d.getDate())}`;
+  if (bucketSec >= 3600)  return `${p(d.getMonth()+1)}/${p(d.getDate())} ${p(d.getHours())}:00`;
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// ---- 范围选择 ----
+const RANGES = [['1h','1h'],['6h','6h'],['24h','24h'],['7天','168'],['30天','720'],['全部','all']];
+function buildRanges(){
+  const box = document.getElementById('ranges');
+  box.innerHTML = '';
+  RANGES.forEach(([label,val])=>{
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.className = 'px-3 py-1.5 transition ' + (state.hours===val
+      ? 'bg-sky-600 text-white' : 'text-slate-400 hover:bg-slate-800');
+    b.onclick = ()=>{ state.hours = val; buildRanges(); load(); };
+    box.appendChild(b);
+  });
+}
+
+// ---- KPI 卡片 ----
+function kpi(label, value, sub){
+  return `<div class="card p-4">
+    <div class="text-[11px] uppercase tracking-wide text-slate-500">${label}</div>
+    <div class="text-2xl font-semibold mt-1 text-slate-100">${value}</div>
+    <div class="text-xs text-slate-500 mt-1">${sub||'&nbsp;'}</div>
+  </div>`;
+}
+function renderKpis(t, cfg){
+  const el = document.getElementById('kpis');
+  // 错误细分:CF 边缘 vs 上游(sub2api)origin —— 用来区分 429/5xx 到底是谁限的。
+  const errSub = t.errors
+    ? `CF ${t.errors_cf||0} · 上游 ${t.errors_upstream||0}` + ((t.errors_other||0)?` · 其他 ${t.errors_other}`:'')
+    : '无错误';
+  el.innerHTML = [
+    kpi('请求数', fmt(t.requests), `错误 ${t.errors} · ${errSub}`),
+    kpi('计费输入 token', fmt(t.total_input_billed), `新增输入 ${fmt(t.input_tokens)}`),
+    kpi('输出 token', fmt(t.output_tokens), `请求体 ${fmt(t.req_bytes)}B`),
+    kpi('缓存命中率', t.cache_hit_pct+'%', `缓存读 ${fmt(t.cache_read)}`),
+    kpi('压缩节省 token', fmt(cfg.total_tokens_saved||0), `压缩 ${cfg.compression_count||0} 次`),
+    kpi('平均响应时间', fmtMs(t.avg_total_ms), `p50 ${fmtMs(t.p50_total_ms)} · p90 ${fmtMs(t.p90_total_ms)}`),
+    kpi('平均首字(prefill)', fmtMs(t.avg_prefill_ms), '输入处理耗时'),
+    kpi('平均生成', fmtMs(t.avg_gen_ms), '输出耗时'),
+    // 单请求(非并发期)吞吐才是真实速率;并发期会互相挤占,bursty(疑似缓冲)样本已排除。
+    kpi('输出吞吐(单请求)', (t.avg_output_tps_single||0)+' t/s',
+        `全部 ${t.avg_output_tps||0} t/s` +
+        ((t.bursty_requests||0)?` · ⚡疑似缓冲 ${fmt(t.bursty_requests)} 次`:'') +
+        ((t.concurrent_requests||0)?` · 并发 ${fmt(t.concurrent_requests)} 次`:'')),
+    kpi('注入压缩请求', fmt(t.injected_requests), `触发阈值 ${fmt(cfg.trigger_tokens||0)}`),
+  ].join('');
+}
+
+// ---- 通用建图 ----
+function draw(id, config){
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(document.getElementById(id), config);
+}
+const gridX = { grid:{display:false}, ticks:{maxTicksLimit:10, autoSkip:true} };
+const gridY = { grid:{color:'#16202e'}, beginAtZero:true };
+
+function timeLabels(s){ return s.labels.map(x=>tickLabel(x, s.bucket_seconds)); }
+
+function renderCharts(d){
+  const s = d.series; s.bucket_seconds = d.bucket_seconds;
+  const labels = timeLabels(s);
+
+  // Token 用量:堆叠柱(输入分项)+ 输出折线(右轴)
+  draw('cTokens', {
+    data: { labels, datasets: [
+      { type:'bar', label:'新增输入', data:s.input_fresh, backgroundColor:C.sky, stack:'in' },
+      { type:'bar', label:'缓存创建', data:s.cache_create, backgroundColor:C.violet, stack:'in' },
+      { type:'bar', label:'缓存读取', data:s.cache_read, backgroundColor:C.cyan, stack:'in' },
+      { type:'line', label:'输出', data:s.output, borderColor:C.amber, backgroundColor:C.amber,
+        yAxisID:'y1', tension:.3, pointRadius:0, borderWidth:2 },
+    ]},
+    options: { interaction:{mode:'index',intersect:false},
+      scales:{ x:{...gridX, stacked:true},
+        y:{...gridY, stacked:true, ticks:{callback:fmt}},
+        y1:{position:'right', beginAtZero:true, grid:{display:false}, ticks:{callback:fmt}} },
+      plugins:{ tooltip:{callbacks:{label:c=>c.dataset.label+': '+fmt(c.parsed.y)}} } }
+  });
+
+  // 请求数
+  draw('cReq', {
+    type:'bar',
+    data:{ labels, datasets:[{ label:'请求数', data:s.requests, backgroundColor:C.emerald }] },
+    options:{ scales:{x:gridX,y:gridY}, plugins:{legend:{display:false}} }
+  });
+
+  // 响应时间拆解:堆叠面积 首字 + 生成
+  draw('cLatTime', {
+    type:'line',
+    data:{ labels, datasets:[
+      { label:'首字(prefill)', data:s.prefill_ms, borderColor:C.cyan, backgroundColor:'rgba(34,211,238,.25)',
+        fill:true, stack:'lat', tension:.3, pointRadius:0, borderWidth:1.5 },
+      { label:'生成', data:s.gen_ms, borderColor:C.violet, backgroundColor:'rgba(139,92,246,.25)',
+        fill:true, stack:'lat', tension:.3, pointRadius:0, borderWidth:1.5 },
+    ]},
+    options:{ interaction:{mode:'index',intersect:false},
+      scales:{ x:gridX, y:{...gridY, stacked:true, ticks:{callback:v=>fmtMs(v)}} },
+      plugins:{ tooltip:{callbacks:{label:c=>c.dataset.label+': '+fmtMs(c.parsed.y)}} } }
+  });
+
+  // 延迟分位
+  const L = d.latency;
+  draw('cLatPct', {
+    type:'bar',
+    data:{ labels:L.labels, datasets:[
+      { label:'总耗时', data:L.total, backgroundColor:C.blue },
+      { label:'首字', data:L.prefill, backgroundColor:C.cyan },
+      { label:'生成', data:L.gen, backgroundColor:C.violet },
+    ]},
+    options:{ scales:{x:{grid:{display:false}}, y:{...gridY, ticks:{callback:v=>fmtMs(v)}}},
+      plugins:{ tooltip:{callbacks:{label:c=>c.dataset.label+': '+fmtMs(c.parsed.y)}} } }
+  });
+
+  // 输出吞吐:单请求(非并发期)vs 并发期。并发期吞吐互相挤占,单列对比更能看出真实速率。
+  draw('cTps', {
+    type:'line',
+    data:{ labels, datasets:[
+      { label:'单请求', data:s.output_tps_single, borderColor:C.pink,
+        backgroundColor:'rgba(236,72,153,.15)', fill:true, tension:.3, pointRadius:0, borderWidth:2 },
+      { label:'并发', data:s.output_tps_concurrent, borderColor:C.amber,
+        backgroundColor:'rgba(251,191,36,.10)', fill:true, tension:.3, pointRadius:0, borderWidth:1.5, borderDash:[4,3] },
+    ]},
+    options:{ interaction:{mode:'index',intersect:false}, scales:{x:gridX,y:gridY},
+      plugins:{ tooltip:{callbacks:{label:c=>c.dataset.label+': '+(c.parsed.y||0)+' t/s'}} } }
+  });
+
+  // 缓存命中率
+  draw('cCache', {
+    type:'line',
+    data:{ labels, datasets:[{ label:'命中率 %', data:s.cache_hit_pct, borderColor:C.emerald,
+      backgroundColor:'rgba(16,185,129,.15)', fill:true, tension:.3, pointRadius:0, borderWidth:2 }] },
+    options:{ scales:{x:gridX,y:{...gridY,max:100,ticks:{callback:v=>v+'%'}}}, plugins:{legend:{display:false}} }
+  });
+
+  // 按模型
+  const m = d.by_model;
+  draw('cModel', {
+    type:'doughnut',
+    data:{ labels:m.map(x=>x.model), datasets:[{ data:m.map(x=>x.total),
+      backgroundColor:PALETTE, borderColor:'#0b1220', borderWidth:2 }] },
+    options:{ cutout:'58%', plugins:{ legend:{position:'right', labels:{boxWidth:10}},
+      tooltip:{callbacks:{label:c=>c.label+': '+fmt(c.parsed)}} } }
+  });
+
+  // 按会话
+  const ss = d.by_session;
+  draw('cSession', {
+    type:'bar',
+    data:{ labels:ss.map(x=>x.session), datasets:[{ label:'token', data:ss.map(x=>x.total),
+      backgroundColor:C.indigo }] },
+    options:{ indexAxis:'y', scales:{x:{...gridY,ticks:{callback:fmt}}, y:{grid:{display:false}}},
+      plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>fmt(c.parsed.x)+' token · '+ss[c.dataIndex].requests+' 次'}}} }
+  });
+}
+
+// ---- HTML 转义(用于把错误响应体安全插进表格) ----
+function esc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c=>(
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---- 最近请求表 ----
+function renderRecent(rows){
+  const tb = document.getElementById('recentBody');
+  if (!rows.length){ tb.innerHTML = '<tr><td colspan="13" class="py-4 text-center text-slate-600">暂无数据</td></tr>'; return; }
+  tb.innerHTML = rows.map(r=>{
+    const isErr = r.status>=400;
+    const stColor = isErr ? 'text-rose-400' : (r.status===200 ? 'text-emerald-400' : 'text-slate-400');
+    // 错误来源徽标:CF=Cloudflare 边缘,上游=sub2api origin。
+    let srcBadge = '';
+    if (isErr && r.err_source){
+      const cf = r.err_source==='cloudflare';
+      const txt = cf?'CF':(r.err_source==='upstream'?'上游':r.err_source);
+      const cls = cf?'bg-orange-500/15 text-orange-300':'bg-rose-500/15 text-rose-300';
+      srcBadge = ` <span class="px-1 rounded ${cls}">${txt}</span>`;
+    }
+    const conc = r.concurrent
+      ? '<span class="text-amber-400" title="与其它请求并发">⇄</span>'
+      : '<span class="text-slate-700">·</span>';
+    // tok/s:bursty(疑似上游缓冲突发)用琥珀色 + ⚡ 标注,并在 tooltip 说明为何不可信。
+    let tpsCell;
+    if (!r.tps){
+      tpsCell = '<span class="text-slate-700">—</span>';
+    } else if (r.bursty){
+      tpsCell = `<span class="text-amber-400" title="疑似上游缓冲突发:整条响应仅 ${r.chunks||'?'} 个数据块送达,这个 tok/s 不是真实生成速率(已排除出吞吐统计)">${r.tps}⚡</span>`;
+    } else {
+      tpsCell = `<span class="text-pink-300" title="${r.chunks?('数据块 '+r.chunks):''}">${r.tps}</span>`;
+    }
+    const clickable = isErr ? ' cursor-pointer' : '';
+    const onclick = isErr ? ' onclick="this.nextElementSibling.classList.toggle(\'hidden\')"' : '';
+    let row = `<tr class="border-b border-slate-900 hover:bg-slate-900/50${clickable}"${onclick}>
+      <td class="py-1.5 pr-3 text-slate-400 whitespace-nowrap font-mono">${fmtClock(r.ts)}</td>
+      <td class="py-1.5 pr-3 text-slate-300 whitespace-nowrap">${esc(r.model)}</td>
+      <td class="py-1.5 pr-3 text-slate-500 font-mono">${esc(r.session)}</td>
+      <td class="py-1.5 pr-3 text-right">${fmt(r.input)}</td>
+      <td class="py-1.5 pr-3 text-right text-slate-400">${fmt(r.cache_read)}</td>
+      <td class="py-1.5 pr-3 text-right">${fmt(r.output)}</td>
+      <td class="py-1.5 pr-3 text-right">${tpsCell}</td>
+      <td class="py-1.5 pr-3 text-right text-slate-400">${fmtMs(r.prefill_ms)}</td>
+      <td class="py-1.5 pr-3 text-right text-slate-400">${fmtMs(r.gen_ms)}</td>
+      <td class="py-1.5 pr-3 text-right">${fmtMs(r.total_ms)}</td>
+      <td class="py-1.5 pr-3 text-center">${conc}</td>
+      <td class="py-1.5 pr-3 text-center">${r.injected?'<span class="text-sky-400">✓</span>':'<span class="text-slate-700">·</span>'}</td>
+      <td class="py-1.5 pr-3 text-right font-mono ${stColor} whitespace-nowrap">${r.status||'—'}${srcBadge}</td>
+    </tr>`;
+    // 错误行:追加一行可展开的「响应明细」(默认隐藏,点击错误行切换)。
+    if (isErr){
+      const meta = [
+        `来源=${r.err_source||'?'}`,
+        r.err_server?`server=${esc(r.err_server)}`:'',
+        r.err_cf_ray?`cf-ray=${esc(r.err_cf_ray)}`:'',
+        r.err_ctype?`content-type=${esc(r.err_ctype)}`:'',
+        r.err_retry_after?`retry-after=${esc(r.err_retry_after)}`:'',
+      ].filter(Boolean).join('  ·  ');
+      const bodyTxt = r.err_snippet ? esc(r.err_snippet) : '(未捕获响应体)';
+      row += `<tr class="hidden bg-slate-900/70">
+        <td colspan="13" class="py-2 px-3 border-b border-slate-800">
+          <div class="text-[11px] text-slate-400 font-mono mb-1">${meta}</div>
+          <pre class="text-[11px] text-rose-200/90 font-mono whitespace-pre-wrap break-all max-h-48 overflow-auto">${bodyTxt}</pre>
+        </td></tr>`;
+    }
+    return row;
+  }).join('');
+}
+
+// ---- 最近请求:按模型/会话筛选(客户端,在最新 100 条内过滤) ----
+function recentDistinct(rows, key){
+  const seen = new Set();
+  rows.forEach(r=>{ if(r[key]) seen.add(r[key]); });
+  return [...seen].sort();
+}
+function fillSelect(sel, vals, allLabel){
+  const cur = sel.value;
+  sel.innerHTML = `<option value="">${allLabel}</option>` +
+    vals.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('');
+  sel.value = vals.includes(cur) ? cur : '';
+}
+function applyRecentFilter(){
+  const rows = state.recentAll || [];
+  const m = document.getElementById('fModel').value;
+  const s = document.getElementById('fSession').value;
+  const f = rows.filter(r => (!m||r.model===m) && (!s||r.session===s));
+  document.getElementById('fCount').textContent =
+    (m||s) ? `${f.length} / ${rows.length} 条` : `${rows.length} 条`;
+  renderRecent(f);
+}
+document.getElementById('fModel').onchange = applyRecentFilter;
+document.getElementById('fSession').onchange = applyRecentFilter;
+
+// ---- 加载 ----
+async function load(){
+  try{
+    const r = await fetch('/stats/data?hours='+encodeURIComponent(state.hours), {cache:'no-store'});
+    const d = await r.json();
+    if (d.error){ document.getElementById('config').textContent = '错误:'+d.error; return; }
+    const cfg = d.config || {};
+    document.getElementById('config').textContent =
+      `上游 ${cfg.upstream_url||'?'} · 端口 ${cfg.listen_port||'?'} · 触发 ${fmt(cfg.trigger_tokens)} → 保留 ${fmt(cfg.target_tokens)} · 摘要器 ${cfg.summarizer_model||'?'}`;
+    document.getElementById('updated').textContent =
+      '更新于 ' + new Date(d.generated_at*1000).toLocaleString() +
+      ' · 窗口 ' + (d.window_hours===null?'全部':d.window_hours+'h') +
+      ' · 桶 ' + (d.bucket_seconds>=3600?(d.bucket_seconds/3600+'h'):(d.bucket_seconds/60+'m'));
+    renderKpis(d.totals, cfg);
+    renderCharts(d);
+    state.recentAll = d.recent || [];
+    fillSelect(document.getElementById('fModel'), recentDistinct(state.recentAll,'model'), '全部模型');
+    fillSelect(document.getElementById('fSession'), recentDistinct(state.recentAll,'session'), '全部会话');
+    applyRecentFilter();
+  }catch(e){
+    document.getElementById('updated').textContent = '加载失败:'+e;
+  }
+}
+
+// ---- 自动刷新 ----
+let timer = null;
+function setupAuto(){
+  if (timer) clearInterval(timer);
+  if (document.getElementById('autoChk').checked) timer = setInterval(load, 15000);
+}
+document.getElementById('refreshBtn').onclick = load;
+document.getElementById('autoChk').onchange = setupAuto;
+
+buildRanges();
+load();
+setupAuto();
+</script>
+</body>
+</html>

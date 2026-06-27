@@ -9,8 +9,8 @@
   "plugins": [
     {
       "name": "rolling-context",
-      "version": "1.7.17",
-      "description": "Rolling context compression with third-party baseURL support — old messages get summarized, recent messages stay verbatim. Config-first, env-fallback for upstream and apikey.",
+      "version": "1.8.0",
+      "description": "Rolling context compression with third-party baseURL support + a built-in token/latency statistics dashboard at /stats. Old messages get summarized, recent messages stay verbatim. Config-first, env-fallback for upstream and apikey.",
       "source": "./plugins/rolling-context",
       "category": "productivity"
     }

@@ -1,5 +1,62 @@
 # ChangeLog
 
+## 1.8.0 — 新增网关统计看板(`/stats`):token、各类耗时、吞吐、缓存的图表化
+
+### 背景
+代理此前只在内存里数 `compression_count` / `total_tokens_saved`,SSE 里也只解析出输入 token 用于触发
+压缩,既不持久化、也看不到全貌。用户想要一个页面统计「用了多少 token、各种时间(输入/输出/响应)、以及
+其他值得看的指标」,并以图表呈现。
+
+### 变更
+- 新增 `proxy/stats.py`:`StatsCollector` —— 内存环形缓冲(上限 5 万条)+ 落盘
+  `~/.claude/rolling-context-stats.jsonl`,代理重启后自动从文件尾部回载历史。内含 `aggregate()`:
+  按时间分桶、求 p50/p90/p99 分位、按模型/会话汇总。零依赖,纯标准库。
+- `proxy/server.py`:
+  - `_handle_messages` 埋点。每个真实 `/v1/messages` 生成调用记一条:输入/缓存读/缓存创建/输出 token、
+    请求与响应字节、是否注入了压缩前缀、状态码,以及四段耗时——
+    **代理开销**(进入→转发)、**首字 prefill**(转发→首字节,≈输入处理时间)、
+    **生成**(首字→末字,≈输出时间)、**总响应时间**。`count_tokens` 探测调用不计,避免污染。
+  - 统一了 SSE usage 解析,新增**输出 token**提取(原先只取输入);原压缩触发逻辑不变。
+  - 新增三个 GET 路由:`/stats`(看板 HTML)、`/stats/data?hours=`(聚合 JSON)。
+- 新增 `proxy/dashboard.html`:单文件暗色看板,Tailwind(CDN)+ Chart.js(已加 SRI 校验)。
+  10 张 KPI 卡 + 8 张图表(token 分项堆叠、请求数、响应时间拆解、延迟分位、输出吞吐、缓存命中率、
+  按模型占比、按会话 Top)+ 最近 100 条请求表。支持 1h/6h/24h/7天/30天/全部 时间窗与 15s 自动刷新。
+
+### 输出速度:单请求 / 并发分别统计 + 缓冲突发识别
+- 每条记录算出**单请求 tok/s**(output_tokens ÷ 生成耗时),在最近请求表里逐条列出。
+- 并发检测:用在途请求登记表,任一时刻在途 >1 即把这段时间内的请求都标 `concurrent`。
+  并发期吞吐会互相挤占而失真,因此 KPI/折线把**单请求吞吐**与**并发吞吐**分开,并发请求在表里以 `⇄` 标注。
+- **缓冲突发(bursty)识别**:单条 Anthropic 流的真实速率约 50~100 tok/s,持续高于此物理上不可能,
+  几乎一定是上游(sub2api)把整条 SSE 缓冲后一次性吐出 —— 首字=末字、生成耗时塌缩、tok/s 虚高。
+  为此记录每条响应的**数据块数 `stream_chunks`**(真流式应有几十~上百块);当 tok/s > 250
+  或整条响应仅 1~2 块送达时判为 bursty,从吞吐统计里**隔离**(否则真实速率被虚高值拉爆),
+  在表里以琥珀色 `⚡` 标注、KPI 给出「疑似缓冲 N 次」。这样「单请求吞吐」反映的才是真实生成速率。
+- 最近请求表支持**按模型 / 会话筛选**(下拉框,在最新 100 条内即时过滤)。
+
+### 错误归因:Cloudflare 边缘 vs 上游(sub2api)origin
+- 对 >=400 的响应记录来源指纹(`server` / `cf-ray` / `cf-mitigated` / `via` / `x-request-id` /
+  `content-type` / `retry-after`)与**响应体片段**(封顶 500 字),并判定 `err_source`:
+  - **cloudflare**:CF 自身拦截(text/html 错误页或带 `cf-mitigated`)。
+  - **upstream**:上游 origin 生成(JSON 错误体 + 源站 `Via`/`X-Request-Id`)——
+    关键点是 sub2api 也挂在 CF 后面,`Server: cloudflare`/`CF-RAY` 几乎人人都有,不能据此判 CF。
+- 看板:KPI「请求数」副标题给出 `CF x · 上游 y` 拆分;最近请求表错误行可**点击展开**,显示来源、
+  指纹与原始响应体(便于直接看上游到底回了什么)。同时这些细节也 `log.warning` 进调试日志。
+
+### 日志按大小滚动,封顶磁盘占用
+- `rolling-context-debug.log` 改用滚动写:单文件 10MB、保留 5 个历史(≈60MB 封顶),
+  防止长期运行把磁盘写爆。可用环境变量 `ROLLING_CONTEXT_LOG_MB` / `ROLLING_CONTEXT_LOG_BACKUPS` 覆写。
+- stdout(被 start-proxy 重定向到 `rolling-context-proxy.log`)降到 INFO 级,体量约为原来的 1/10;
+  完整 DEBUG 仍写入会滚动的 debug.log。首次升级启动时,既有的超大 debug.log 会被滚成 `.1` 并随后被淘汰。
+
+### 用法
+代理已把 `ANTHROPIC_BASE_URL` 指向本机,浏览器打开 `http://127.0.0.1:5588/stats` 即可。
+统计随对话自然累积,JSONL 落盘后跨重启保留。
+
+### 影响
+- 默认开启,零配置。统计为「旁路」记录,不改变代理转发/压缩行为,失败被吞不影响请求。
+- 新增本地文件 `~/.claude/rolling-context-stats.jsonl`(追加写,一行一条);看板的 Tailwind/Chart.js
+  走公网 CDN,浏览器需可联网(本机离线时图表不渲染,数据接口不受影响)。
+
 ## 1.7.19 — 真正修掉 Windows hook 报 `<盘符>:\dev\null`(1.7.17 修漏了)
 
 ### 背景
