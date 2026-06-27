@@ -434,40 +434,40 @@ class CompressionStore:
                     continue
                 # Search for the hash chain in msg_hashes
                 chain_len = len(oh)
-                found = False
                 for start in range(len(msg_hashes) - chain_len + 1):
                     if msg_hashes[start:start + chain_len] == oh:
                         end = start + chain_len
                         if end > best_end:
                             best = entry
                             best_end = end
-                        found = True
                         break
-                if not found and chain_len <= len(msg_hashes):
-                    # Count total mismatches
-                    mismatches = []
-                    for i in range(min(chain_len, len(msg_hashes))):
-                        if oh[i] != msg_hashes[i]:
-                            mismatches.append(i)
-                    log.warning(
-                        f"[MATCH] No match: chain={chain_len} req={len(msg_hashes)} "
-                        f"mismatches={len(mismatches)} at positions: "
-                        f"{mismatches[:10]}{'...' if len(mismatches) > 10 else ''}"
-                    )
-                    # Dump content of first mismatched message for debugging
-                    if mismatches and messages and entry.get("_debug_messages"):
-                        idx = mismatches[0]
-                        stored_msg = entry["_debug_messages"][idx] if idx < len(entry["_debug_messages"]) else None
-                        incoming_msg = messages[idx] if idx < len(messages) else None
-                        if stored_msg and incoming_msg:
-                            s_content = str(stored_msg.get("content", ""))[:500]
-                            i_content = str(incoming_msg.get("content", ""))[:500]
-                            log.warning(
-                                f"[MATCH] Mismatch at [{idx}] role={stored_msg.get('role')}:\n"
-                                f"  STORED:   {s_content}\n"
-                                f"  INCOMING: {i_content}"
-                            )
+            # 整体一条都没命中才记日志,且降到 debug:store 全局共享,多会话并存时「某条压缩与本请求
+            # 不匹配」是常态。原先逐条 warning 会按条数刷爆两个 handler、还拖慢热路径。
+            if best is None and self._compressions and log.isEnabledFor(logging.DEBUG):
+                self._log_no_match(msg_hashes, messages)
             return best, best_end
+
+    def _log_no_match(self, msg_hashes: list, messages: list):
+        """未命中诊断(debug 级,仅在整体无命中时调用一次):挑第一条存有原文的候选,
+        打印其哈希链首个失配位置两端的内容,定位「内容为何漂移」。已在 find_match 的锁内调用。"""
+        for entry in self._compressions:
+            oh = entry.get("original_hashes") or []
+            dbg = entry.get("_debug_messages")
+            if not oh or not dbg:
+                continue
+            idx = next((i for i in range(min(len(oh), len(msg_hashes))) if oh[i] != msg_hashes[i]), None)
+            if idx is None:
+                continue
+            stored = dbg[idx] if idx < len(dbg) else None
+            incoming = messages[idx] if messages and idx < len(messages) else None
+            if stored and incoming:
+                log.debug(
+                    f"[MATCH] No match among {len(self._compressions)} stored; first diff at [{idx}] "
+                    f"role={stored.get('role')}:\n  STORED:   {str(stored.get('content', ''))[:300]}\n"
+                    f"  INCOMING: {str(incoming.get('content', ''))[:300]}"
+                )
+                return
+        log.debug(f"[MATCH] No match among {len(self._compressions)} stored compression(s)")
 
     def add(self) -> dict:
         entry = {
@@ -482,7 +482,25 @@ class CompressionStore:
         }
         with self._lock:
             self._compressions.append(entry)
+            self._prune_locked()
         return entry
+
+    def _prune_locked(self):
+        """内存表封顶(已持锁):落盘/加载只在两端裁剪,内存里的 _compressions 原本只增不减,
+        emergency 兜底与跨会话残留会让 find_match 的全表线性扫描越来越慢。超过 STORE_MAX_ENTRIES 时
+        丢弃最老的空闲条目;正在后台压缩(thread 仍 alive)的一律保留,避免删掉马上要转正的成果。"""
+        if len(self._compressions) <= STORE_MAX_ENTRIES:
+            return
+
+        def busy(e):
+            t = e.get("thread")
+            return t is not None and t.is_alive()
+
+        alive = [e for e in self._compressions if busy(e)]
+        idle = [e for e in self._compressions if not busy(e)]
+        room = max(0, STORE_MAX_ENTRIES - len(alive))
+        keep = {id(e) for e in alive} | {id(e) for e in (idle[-room:] if room else [])}
+        self._compressions = [e for e in self._compressions if id(e) in keep]
 
     def remove(self, entry: dict):
         with self._lock:
@@ -701,9 +719,12 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
         prefix = compressed[:prefix_len]
         # Key = the messages that were summarized away (not the verbatim ones).
         key_hashes, summarized = _compression_key_hashes(messages, compressed, prefix_len)
-        entry["pending"] = prefix
+        # 发布顺序:先备好 hashes/debug,最后才置 pending。promote_pending 以「pending 非空」为
+        # 转正信号,故 pending 一旦可见就必须保证 pending_hashes 已就绪——否则会读到半成品、
+        # 把 original_hashes 置空,这条压缩白丢还留个永不命中的死条目。
         entry["pending_hashes"] = key_hashes
         entry["_debug_messages"] = summarized  # for mismatch debugging
+        entry["pending"] = prefix
         log.info(
             f"[BG] Compression ready: "
             f"{compressor._count_chars(prefix):,} chars "
@@ -726,7 +747,7 @@ def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg
     compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real)
     if prefix_len == 0:
         log.warning("[EMG] Nothing to compress (prefix_len=0); cannot shrink request")
-        return None
+        return None, None
     key_hashes, summarized = _compression_key_hashes(messages, compressed, prefix_len)
     entry = store.add()
     entry["prefix"] = compressed[:prefix_len]
@@ -740,7 +761,7 @@ def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg
         f"({compressor._count_chars(compressed):,} chars, key={len(key_hashes)} hashes); "
         f"registered for future matches"
     )
-    return compressed
+    return compressed, entry  # 返回条目,供调用方在随后触发后台压缩时当父条目回收
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -1122,6 +1143,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 把结果换进请求体重试一发——CC 端永不看到这发 400。也让 CC 自己的 autoCompact/`/compact`
             # 那发超限摘要请求得以成功,把真实 transcript 焊小。最多重试一发,压不动/仍失败则原样回 400。
             prebuffered = None  # 非重试的 400:已读出的错误体,直接回给 CC(不再走流式读取)
+            emergency_entry = None  # 同步兜底登记的条目;随后若触发后台压缩,用它当父条目回收
             if EMERGENCY_COMPRESS and not is_count and not injected and resp.status == 400:
                 err_preview = resp.read()  # 400 体很小
                 conn.close()
@@ -1133,7 +1155,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     )
                     new_msgs = None
                     try:
-                        new_msgs = _emergency_compress(current_messages, auth_headers, reported, msg_chars)
+                        new_msgs, emergency_entry = _emergency_compress(current_messages, auth_headers, reported, msg_chars)
                     except Exception as ex:
                         log.error(f"[MSG] Emergency compression failed: {ex}", exc_info=True)
                     if new_msgs is not None:
@@ -1306,7 +1328,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     )
                     entry = store.add()
                     entry["pre_tokens"] = total_input  # 压缩前规模,注入生效时展示收缩效果
-                    entry["parent"] = match  # 本次压缩建立在 match 之上;转正后 match 即死条目,回收掉
+                    # 本次压缩建立在已注入的条目之上;转正后那条即死条目,回收掉。常态是 match;
+                    # 若这发走了 emergency 同步兜底(match 必为 None),则父是 emergency 登记的条目。
+                    entry["parent"] = match if match is not None else emergency_entry
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),

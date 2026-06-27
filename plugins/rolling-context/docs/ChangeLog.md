@@ -1,5 +1,29 @@
 # ChangeLog
 
+## 1.13.0 — 整体功能审查后的四处加固:发布顺序竞态、日志降噪、内存封顶、emergency 回收
+
+### 背景
+1.11/1.12 把落盘与父条目回收做完后,对代理核心 `server.py` 做了一遍整体审查,修掉四处遗漏。
+
+### 变更(`proxy/server.py`)
+- **发布顺序竞态**:`_do_background_compression` 原先先置 `pending` 再置 `pending_hashes`。
+  `promote_pending` 以「`pending` 非空」为转正信号,若恰在两次赋值之间转正,会读到 `pending` 已设、
+  `pending_hashes` 仍 `None` → `original_hashes` 被置空,这条压缩白丢还留个永不命中的死条目。改为
+  **最后才发布 `pending`**(hashes/debug 先备好),`pending` 一旦可见即保证 hashes 已就绪。
+- **日志降噪**:`find_match` 原对每条不匹配条目都打 `warning` 并 dump。store 全局共享、多会话并存时
+  「单条不匹配」是常态,逐条 warning 按条数刷爆两个 handler、还拖慢热路径。改为**仅整体未命中时记
+  一条 `debug`**,诊断 dump 提取到 `_log_no_match`(只在 DEBUG 开启时跑)。
+- **内存表封顶**:`STORE_MAX_ENTRIES` 原只在落盘/加载两端裁剪,进程内存里的 `_compressions` 只增不减,
+  emergency 兜底与跨会话残留会让全表线性扫描越来越慢。新增 `_prune_locked()`,`add()` 时裁剪最老的
+  空闲条目;**正在后台压缩(thread alive)的一律保留**,绝不删掉马上要转正的成果。
+- **emergency 条目回收**:`_emergency_compress` 改为返回 `(compressed, entry)`;同步兜底后若这发又触发
+  后台压缩(`match` 必为 None),用 emergency 登记的条目当父条目回收,避免每次兜底多留一条死条目。
+
+### 实测(2026-06-27)
+`proxy/test_emergency.py` 新增 `BackgroundCompressionPublish`/`MemoryCap`/`EmergencyReturn` 单元用例,
+以及 `EmergencyRetryEndToEnd` 端到端集成测试(假上游先 400 too-long、重试 200,断言客户端只见 200、
+上游恰好两跳、同步压缩条目落库)。全套 24 例 + `test_lifecycle` 2 例,合计 26 例全绿。
+
 ## 1.12.0 — 并发会话回收父死条目:store 的 40 槽真正等于 40 条并发血脉
 
 ### 背景(全局共享 store 在并发下会被「死条目」悄悄占满）

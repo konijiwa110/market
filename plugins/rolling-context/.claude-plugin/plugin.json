@@ -1,6 +1,6 @@
 {
   "name": "rolling-context",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "description": "Rolling context compression with third-party baseURL support — old messages get summarized, recent messages stay verbatim. Never hit the context wall.",
   "author": {
     "name": "konijiwa110"
