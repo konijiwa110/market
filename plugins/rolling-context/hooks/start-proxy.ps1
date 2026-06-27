@@ -3,7 +3,20 @@
 
 $ErrorActionPreference = "SilentlyContinue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 网关代码源:优先用 marketplace clone(单一最新源——`/plugin marketplace update` 或 `git pull`
+# 刷新它即可,更新网关无需 /plugin update 重新 cache、无需重启 CC)。找不到 clone 时回退到本地
+# cache 副本(可移植)。$ScriptDir 形如 <plugins>\cache\<MP>\rolling-context\<VER>\hooks。
 $ProxyDir = Join-Path $ScriptDir "..\proxy"
+$SrcPluginJson = Join-Path $ScriptDir "..\.claude-plugin\plugin.json"
+if ($ScriptDir -match '\\cache\\') {
+    $PluginsRoot = [System.IO.Path]::GetFullPath((Join-Path $ScriptDir "..\..\..\..\.."))
+    $MpName = Split-Path ([System.IO.Path]::GetFullPath((Join-Path $ScriptDir "..\..\..")))  -Leaf
+    $Cand = Join-Path $PluginsRoot "marketplaces\$MpName\plugins\rolling-context"
+    if (Test-Path (Join-Path $Cand "proxy\server.py")) {
+        $ProxyDir = Join-Path $Cand "proxy"
+        $SrcPluginJson = Join-Path $Cand ".claude-plugin\plugin.json"
+    }
+}
 $ClaudeDir = Join-Path $env:USERPROFILE ".claude"
 $PidFile = Join-Path $ClaudeDir "rolling-context-proxy.pid"
 $VerFile = Join-Path $ClaudeDir "rolling-context-proxy.version"
@@ -16,8 +29,7 @@ if (Test-Path $ConfigFile) { try { $Cfg = Get-Content $ConfigFile -Raw | Convert
 $Port = if ($Cfg -and $Cfg.port) { "$($Cfg.port)" } elseif ($env:ROLLING_CONTEXT_PORT) { $env:ROLLING_CONTEXT_PORT } else { "5588" }
 $ProxyUrl = "http://127.0.0.1:$Port"
 $HasConfigUpstream = ($null -ne $Cfg) -and ($null -ne $Cfg.upstream) -and ($Cfg.upstream -ne "")
-$PluginJson = Join-Path $ScriptDir "..\.claude-plugin\plugin.json"
-$CurrentVersion = if (Test-Path $PluginJson) { (Get-Content $PluginJson -Raw | ConvertFrom-Json).version } else { "unknown" }
+$CurrentVersion = if (Test-Path $SrcPluginJson) { (Get-Content $SrcPluginJson -Raw | ConvertFrom-Json).version } else { "unknown" }
 
 function Log($msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"

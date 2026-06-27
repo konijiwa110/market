@@ -3,7 +3,22 @@
 # Pure stdlib — no venv needed, just python
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# 网关代码源:优先用 marketplace clone(单一最新源——`/plugin marketplace update` 或 `git pull`
+# 刷新它即可,更新网关无需 /plugin update 重新 cache、无需重启 CC)。找不到 clone 时回退到本地
+# cache 副本(可移植)。$SCRIPT_DIR 形如 <plugins>/cache/<MP>/rolling-context/<VER>/hooks。
 PROXY_DIR="$SCRIPT_DIR/../proxy"
+SRC_PLUGIN_JSON="$SCRIPT_DIR/../.claude-plugin/plugin.json"
+case "$SCRIPT_DIR" in
+  */cache/*)
+    _PLUGINS_ROOT="$(cd "$SCRIPT_DIR/../../../../.." 2>/dev/null && pwd)"
+    _MP_NAME="$(basename "$(cd "$SCRIPT_DIR/../../.." 2>/dev/null && pwd)")"
+    _CLONE="$_PLUGINS_ROOT/marketplaces/$_MP_NAME/plugins/rolling-context"
+    if [ -f "$_CLONE/proxy/server.py" ]; then
+        PROXY_DIR="$_CLONE/proxy"
+        SRC_PLUGIN_JSON="$_CLONE/.claude-plugin/plugin.json"
+    fi
+    ;;
+esac
 PIDFILE="$HOME/.claude/rolling-context-proxy.pid"
 VERFILE="$HOME/.claude/rolling-context-proxy.version"
 HOOKLOG="$HOME/.claude/rolling-context-hook.log"
@@ -35,7 +50,7 @@ PYEOF
 # 兜底:任何原因导致 PORT 为空(python 缺失/异常)都不能让 URL 丢端口。
 [ -z "$PORT" ] && PORT=5588
 PROXY_URL="http://127.0.0.1:$PORT"
-CURRENT_VERSION=$(cat "$SCRIPT_DIR/../.claude-plugin/plugin.json" 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')
+CURRENT_VERSION=$(cat "$SRC_PLUGIN_JSON" 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HOOKLOG"
