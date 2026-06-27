@@ -346,7 +346,9 @@ def _remark_cache_breakpoints(msgs: list):
 # --resume 长会话时 store 为空 → 第一发裸转全量历史(异步压缩只能为「下一发」备料,救不了「这一发」)。
 # 持久化后,重启/恢复时 store 是热的,长会话首发直接命中、不再满历史发送。
 STORE_FILE = os.path.join(_CLAUDE_DIR, "rolling-context-store.json")
-STORE_MAX_ENTRIES = 40  # 落盘保留的最近压缩条数上限,防止文件无界增长(越晚的条目覆盖历史越多)
+# 落盘保留的最近压缩条数上限,防止文件无界增长(越晚的条目覆盖历史越多)。回收父条目后每会话只剩 1 条
+# 活条目,40 即 40 条并发血脉,足够任何现实并发;多会话超高并发可用 ROLLING_CONTEXT_STORE_MAX 调大。
+STORE_MAX_ENTRIES = int(_cfg("store_max_entries", "ROLLING_CONTEXT_STORE_MAX", 40))
 
 
 class CompressionStore:
@@ -476,6 +478,7 @@ class CompressionStore:
             "thread": None,          # background compression thread
             "used": False,           # 是否已被某个请求注入过(用于标记「压缩生效的第一个请求」)
             "pre_tokens": 0,         # 触发本次压缩时的上下文 token 数(压缩前规模,用于展示收缩效果)
+            "parent": None,          # 本压缩建立其上的父条目(同会话上一次压缩);转正时回收,避免死条目堆积
         }
         with self._lock:
             self._compressions.append(entry)
@@ -484,6 +487,34 @@ class CompressionStore:
     def remove(self, entry: dict):
         with self._lock:
             self._compressions = [e for e in self._compressions if e is not entry]
+
+    def promote_pending(self) -> int:
+        """把已就绪的 pending 压缩转正为活条目,回收其父条目(死条目),并落盘。返回转正条数。
+
+        子压缩转正(prefix 就绪)后,它建立其上的父条目此后永不会再被选为 best → 回收掉,
+        使每个会话在表里只剩 1 条活条目,避免死条目把全局名额(STORE_MAX_ENTRIES)堆满、
+        把别的并发会话挤出去。先置 prefix 再删父,中间无空窗;父可能为 None(本会话首压)
+        或已被删,remove 容错。"""
+        promoted = 0
+        for entry in list(self._compressions):  # 拷一份:回收会改 _compressions,避免迭代中改
+            if entry.get("pending") is None:
+                continue
+            entry["prefix"] = entry["pending"]
+            entry["original_hashes"] = entry["pending_hashes"]
+            entry["pending"] = None
+            entry["pending_hashes"] = None
+            promoted += 1
+            parent = entry.pop("parent", None)
+            if parent is not None and parent is not entry:
+                self.remove(parent)
+            log.info(
+                f"[MSG] Compression promoted: {len(entry['prefix'])} prefix messages "
+                f"replacing {len(entry['original_hashes'])} originals"
+                f"{' (reaped 1 parent)' if parent is not None else ''}"
+            )
+        if promoted:
+            self.persist()  # 转正即落盘,重启后免冷启动满历史发送
+        return promoted
 
     @property
     def compressions(self):
@@ -996,21 +1027,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception as e:
             log.debug(f"[MSG] breakdown failed: {e}")
 
-        # Promote any pending compressions
-        promoted_any = False
-        for entry in store.compressions:
-            if entry["pending"] is not None:
-                entry["prefix"] = entry["pending"]
-                entry["original_hashes"] = entry["pending_hashes"]
-                entry["pending"] = None
-                entry["pending_hashes"] = None
-                promoted_any = True
-                log.info(
-                    f"[MSG] Compression promoted: {len(entry['prefix'])} prefix messages "
-                    f"replacing {len(entry['original_hashes'])} originals"
-                )
-        if promoted_any:
-            store.persist()  # 后台压缩转正即落盘,重启后免冷启动满历史发送
+        # Promote any pending compressions(转正 + 回收父死条目 + 落盘,见 promote_pending)
+        store.promote_pending()
 
         # Scan: do any stored compressions match this request's messages?
         match, match_end = store.find_match(msg_hashes, messages)
@@ -1288,6 +1306,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     )
                     entry = store.add()
                     entry["pre_tokens"] = total_input  # 压缩前规模,注入生效时展示收缩效果
+                    entry["parent"] = match  # 本次压缩建立在 match 之上;转正后 match 即死条目,回收掉
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),

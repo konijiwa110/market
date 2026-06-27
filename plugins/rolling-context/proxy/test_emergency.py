@@ -174,5 +174,64 @@ class StorePersistence(unittest.TestCase):
         self.assertEqual(s.compressions, [])
 
 
+class PromoteReaping(unittest.TestCase):
+    """promote_pending reaps the parent so each session keeps only 1 live entry."""
+
+    def setUp(self):
+        self._fd, self._path = tempfile.mkstemp(prefix="rc-reap-", suffix=".json")
+        os.close(self._fd)
+        self._orig = server.STORE_FILE
+        server.STORE_FILE = self._path
+
+    def tearDown(self):
+        server.STORE_FILE = self._orig
+        for p in (self._path, self._path + ".tmp"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def test_child_promotion_reaps_parent(self):
+        s = server.CompressionStore()
+        parent = s.add()  # an already-active prior compression for this session
+        parent["original_hashes"] = ["p0", "p1"]
+        parent["prefix"] = [{"role": "user", "content": "S1"}]
+        parent["used"] = True
+        child = s.add()  # next compression, built on top of parent
+        child["pending"] = [{"role": "user", "content": "S2"}]
+        child["pending_hashes"] = ["c0", "c1"]
+        child["parent"] = parent
+
+        n = s.promote_pending()
+        self.assertEqual(n, 1)
+        # parent is gone, child is the sole live entry, now promoted
+        self.assertEqual(len(s.compressions), 1)
+        self.assertIs(s.compressions[0], child)
+        self.assertEqual(child["original_hashes"], ["c0", "c1"])
+        self.assertIsNone(child["pending"])
+        # and the reaped state is what got persisted
+        s2 = server.CompressionStore()
+        self.assertEqual(len(s2.compressions), 1)
+        self.assertEqual(s2.compressions[0]["original_hashes"], ["c0", "c1"])
+
+    def test_first_compression_has_no_parent_to_reap(self):
+        s = server.CompressionStore()
+        first = s.add()  # cold session: no prior compression
+        first["pending"] = [{"role": "user", "content": "S"}]
+        first["pending_hashes"] = ["h0"]
+        # parent stays None (default)
+        n = s.promote_pending()
+        self.assertEqual(n, 1)
+        self.assertEqual(len(s.compressions), 1, "nothing to reap; entry just promotes")
+
+    def test_nothing_pending_is_a_noop(self):
+        s = server.CompressionStore()
+        e = s.add()
+        e["original_hashes"] = ["x"]
+        e["prefix"] = [{"role": "user", "content": "S"}]
+        self.assertEqual(s.promote_pending(), 0)
+        self.assertEqual(len(s.compressions), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
