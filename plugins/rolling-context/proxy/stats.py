@@ -117,6 +117,8 @@ class StatsCollector:
             "concurrent_requests": 0,
             # 疑似上游缓冲突发(tok/s 虚高)的请求数 —— 这些样本不计入吞吐统计。
             "bursty_requests": 0,
+            # 压缩器(摘要)调用次数与其中失败数 —— 让压缩开销/失败单独可见。
+            "compression_calls": 0, "compression_errors": 0,
         }
         total_ms_list, prefill_list, gen_list, tps_list = [], [], [], []
         # 单请求(非并发期)吞吐单独成列,与全部吞吐对比 —— 并发期内吞吐会互相挤占失真。
@@ -156,6 +158,10 @@ class StatsCollector:
                 totals["concurrent_requests"] += 1
             if bursty:
                 totals["bursty_requests"] += 1
+            if r.get("kind") == "compression":
+                totals["compression_calls"] += 1
+                if status >= 400:
+                    totals["compression_errors"] += 1
             if status >= 400:
                 totals["errors"] += 1
                 src = r.get("err_source")
@@ -315,6 +321,12 @@ class StatsCollector:
                 "err_ctype": r.get("err_ctype", ""),
                 "err_cf_ray": r.get("err_cf_ray", ""),
                 "err_snippet": r.get("err_snippet", ""),
+                # 压缩可视化:kind 区分压缩器调用 vs 用户请求;first_compressed 标记压缩生效的第一个
+                # 请求;pre_tokens 是压缩前规模(配合该请求的 input 展示收缩);conv_chars 是被摘正文长度。
+                "kind": r.get("kind", "request"),
+                "first_compressed": bool(r.get("first_compressed")),
+                "pre_tokens": r.get("pre_tokens", 0) or 0,
+                "conv_chars": r.get("conv_chars", 0) or 0,
             })
 
         return {

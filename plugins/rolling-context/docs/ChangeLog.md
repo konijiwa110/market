@@ -1,5 +1,36 @@
 # ChangeLog
 
+## 1.8.1 — 修掉 giant 会话压缩失败(摘要器 200K 超限),压缩调用进看板,标记压缩生效点
+
+### 背景(1.8.0 上线后从生产日志发现)
+线上日志里有 31 次 `prompt is too long` 被上游拒。拆开看是两类、且互为因果:
+- **摘要器侧 200000 超限(主因,约 26 次)**:`[BG] Compression failed: Summarization API returned 400:
+  ... 202835 tokens > 200000 maximum`。摘要器是 200K 上下文的 Haiku,而单块正文预算
+  `SUMMARIZER_INPUT_CHAR_BUDGET` 旧值 450K 字符——注释按 3~3.7 字符/token 估算,但实测代码/CJK
+  内容约 **2.2 字符/token**,450K 字符 ≈ 205K token 已超限。**一块超限就抛 `RuntimeError`,让整次
+  压缩失败** → 主上下文永不收缩。
+- **主请求侧 1000000 超限(后果,约 4 次)**:压缩从不成功,历史无限增长,最终主请求撞 1M 硬墙。
+- 另有数次摘要器调用 `read operation timed out`(120s 偏紧,16K 输出可能跑 100~200s)。
+
+### 变更
+- `proxy/compressor.py`:
+  - `SUMMARIZER_INPUT_CHAR_BUDGET` 450K → **250K 字符**(≈110~135K token),给既有滚动摘要 + 模板
+    留足余量。
+  - 新增 `_summarize_messages()`:某块即便仍被摘要器以 "prompt is too long" 拒绝,也会把消息**二分递归
+    续摘**(上半段摘要作为下半段的 existing_summary),单条已截到 ~4KB 必然收敛——任何单块都不再拖垮整次
+    压缩。`compress()` 统一走「分块 + 逐块滚动 + 自愈」。
+  - 摘要器超时 120s → **240s**(可配 `ROLLING_CONTEXT_SUMMARIZER_TIMEOUT`);更小的块也让单次更快。
+  - 新增 `stats_sink` 回调:每次摘要器调用(成功/失败)落一条统计。
+- `proxy/server.py`:压缩器的摘要调用本不经过代理请求路径、看板看不到;现注入 `_record_compression_call`
+  回灌,**压缩请求(含 200000 超限的摘要器 400)也进 `/stats`**。压缩条目新增 `used`/`pre_tokens`,在
+  **压缩生效的第一个请求**上打标记(带压缩前→后的 token 规模)。
+- `proxy/stats.py`:`recent` 透传 `kind`/`first_compressed`/`pre_tokens`/`conv_chars`;`totals` 新增
+  `compression_calls`/`compression_errors`。
+- `proxy/dashboard.html`:
+  - 错误明细体抽出上游 JSON 的 `.error.message` 置顶展示,并按 `prompt is too long: A > B` 给人话提示
+    (区分 200000=摘要器超限 / 1000000=主请求未压缩);状态格悬停即见。
+  - 最近请求表给压缩调用打「压缩」徽标、给压缩生效的首个请求打「✂ 生效 2.0M→82k」徽标。
+
 ## 1.8.0 — 新增网关统计看板(`/stats`):token、各类耗时、吞吐、缓存的图表化
 
 ### 背景

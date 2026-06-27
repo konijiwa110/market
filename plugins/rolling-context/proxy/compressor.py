@@ -10,6 +10,7 @@ Pure stdlib — no external dependencies.
 import json
 import os
 import ssl
+import time
 import uuid
 import gzip
 import zlib
@@ -70,11 +71,16 @@ def _join_path(upstream_path: str, request_path: str) -> str:
 SUMMARY_MARKER = "[ROLLING_CONTEXT_SUMMARY]"
 SUMMARY_END_MARKER = "[/ROLLING_CONTEXT_SUMMARY]"
 
-# 单次摘要调用喂给摘要器的「会话正文」字符上限。摘要器是 200K 上下文的 Haiku;留出输出(16K tok)、
-# 既有滚动摘要(≤16K tok)与模板的余量后,会话正文控制在 ~450K 字符(~120–150K tok)以内。
-# to_compress 文本超过此值即分块:逐块把上一块的摘要作为 existing_summary 续摘,避免一次塞爆 →
-# 上游 400 "prompt is too long > 200000"(1.7.14 实测 giant 会话的主要失败模式)。
-SUMMARIZER_INPUT_CHAR_BUDGET = int(os.environ.get("ROLLING_CONTEXT_SUMMARIZER_CHAR_BUDGET") or 450_000)
+# 单次摘要调用喂给摘要器的「会话正文」字符上限。摘要器是 200K 上下文的 Haiku;输入侧要塞下:
+# 会话正文 + 既有滚动摘要(≤16K tok)+ 系统/模板。实测代码/CJK 内容约 2.2 字符/token——旧值 450K
+# 字符 ≈205K token 已超 200K 上限(这正是 [BG] Compression failed: prompt too long > 200000 的根因,
+# 一块超限就抛 RuntimeError 让整次压缩失败、主上下文永不收缩 → 最终撞 1M 硬墙)。压到 250K 字符
+# (≈110–135K token)留足余量;万一仍超限,compress() 会对该块二分自愈(见 _summarize_messages)。
+SUMMARIZER_INPUT_CHAR_BUDGET = int(os.environ.get("ROLLING_CONTEXT_SUMMARIZER_CHAR_BUDGET") or 250_000)
+
+# 摘要器单次调用超时(秒)。max_tokens=16K 的输出在 Haiku 上可能跑 100–200s,旧值 120s 偏紧会
+# 触发 "read operation timed out" 让压缩失败;放宽到 240s。配合更小的分块,单次调用也更快。
+SUMMARIZER_TIMEOUT = int(os.environ.get("ROLLING_CONTEXT_SUMMARIZER_TIMEOUT") or 240)
 
 SUMMARIZE_PROMPT = """You are a context compressor for an AI coding assistant conversation.
 
@@ -138,6 +144,9 @@ class RollingCompressor:
         self.summarizer_model = summarizer_model
         self.compression_count = 0
         self.total_tokens_saved = 0
+        # 可选回调：每次摘要器调用(成功或失败)落一条统计,让压缩请求也进 /stats 看板。
+        # server.py 注入后,sink(rec) 负责补 ts/session 并写入 StatsCollector。签名:sink(dict)->None。
+        self.stats_sink = None
         # 摘要上游：显式传入 > 环境变量 > 默认。修复原版只读 env、对第三方 baseURL 失效（固定打 api.anthropic.com）。
         url = (
             summarizer_url
@@ -156,8 +165,8 @@ class RollingCompressor:
     def _conn(self):
         """到摘要上游的连接（按实例的 summarizer_url）。"""
         if self._scheme == "https":
-            return http.client.HTTPSConnection(self._host, self._port or 443, context=ssl_ctx, timeout=120)
-        return http.client.HTTPConnection(self._host, self._port or 80, timeout=120)
+            return http.client.HTTPSConnection(self._host, self._port or 443, context=ssl_ctx, timeout=SUMMARIZER_TIMEOUT)
+        return http.client.HTTPConnection(self._host, self._port or 80, timeout=SUMMARIZER_TIMEOUT)
 
     @staticmethod
     def _image_chars(source) -> int:
@@ -402,24 +411,92 @@ class RollingCompressor:
 
         summarizer_path = _join_path(self._summ_path, "/v1/messages")
 
-        conn = self._conn()
-        conn.request("POST", summarizer_path, body=req_body, headers=headers)
-        resp = conn.getresponse()
-        resp_body = resp.read()
-        enc = (resp.getheader("Content-Encoding") or "").lower()
-        conn.close()
+        # 计时 + 抓状态/usage,无论成败都落一条统计(finally),让压缩调用进 /stats 看板。
+        t0 = time.perf_counter()
+        status = 0
+        in_tok = out_tok = 0
+        err_snippet = ""
+        try:
+            conn = self._conn()
+            conn.request("POST", summarizer_path, body=req_body, headers=headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            enc = (resp.getheader("Content-Encoding") or "").lower()
+            conn.close()
+            status = resp.status
 
-        # 上游可能无视 accept-encoding:identity 仍回 gzip/deflate，按 Content-Encoding 解压兜底。
-        if "gzip" in enc:
-            resp_body = gzip.decompress(resp_body)
-        elif "deflate" in enc:
-            resp_body = zlib.decompress(resp_body)
+            # 上游可能无视 accept-encoding:identity 仍回 gzip/deflate，按 Content-Encoding 解压兜底。
+            if "gzip" in enc:
+                resp_body = gzip.decompress(resp_body)
+            elif "deflate" in enc:
+                resp_body = zlib.decompress(resp_body)
 
-        if resp.status != 200:
-            error = resp_body.decode("utf-8", errors="replace")
-            raise RuntimeError(f"Summarization API returned {resp.status}: {error[:500]}")
-        data = json.loads(resp_body)
-        return data["content"][0]["text"]
+            if status != 200:
+                err_snippet = resp_body.decode("utf-8", errors="replace")[:600]
+                raise RuntimeError(f"Summarization API returned {status}: {err_snippet[:500]}")
+            data = json.loads(resp_body)
+            usage = data.get("usage") or {}
+            in_tok = usage.get("input_tokens", 0) or 0
+            out_tok = usage.get("output_tokens", 0) or 0
+            return data["content"][0]["text"]
+        except Exception as e:
+            # 连接/超时(无 HTTP 状态)也记下来,err_snippet 取异常文本。
+            if status == 0 and not err_snippet:
+                err_snippet = str(e)[:600]
+            raise
+        finally:
+            self._emit_stat(
+                status=status, in_tok=in_tok, out_tok=out_tok,
+                req_bytes=len(req_body), conv_chars=len(conversation_text),
+                dur_ms=round((time.perf_counter() - t0) * 1000, 1), err_snippet=err_snippet,
+            )
+
+    def _emit_stat(self, status, in_tok, out_tok, req_bytes, conv_chars, dur_ms, err_snippet):
+        """把一次摘要器调用落成一条统计记录交给 stats_sink(由 server 注入,补 ts/session 后入库)。
+        非流式单响应 → t_gen_ms 置 0,自然落在吞吐(tok/s)统计之外,不污染真实生成速率。"""
+        sink = self.stats_sink
+        if not sink:
+            return
+        rec = {
+            "kind": "compression",          # 看板据此打「压缩」徽标、与用户自己的请求区分
+            "model": self.summarizer_model,
+            "status": status or 502,        # 0 = 连接失败,记 502
+            "input_tokens": in_tok, "output_tokens": out_tok,
+            "cache_read": 0, "cache_create": 0,
+            "stream": False, "stream_chunks": 0,
+            "req_bytes": req_bytes, "resp_bytes": 0,
+            "t_overhead_ms": 0, "t_prefill_ms": 0, "t_gen_ms": 0, "t_total_ms": dur_ms,
+            "concurrent": False, "injected": False,
+            "conv_chars": conv_chars,
+        }
+        if err_snippet and (status == 0 or status >= 400):
+            rec["err_snippet"] = err_snippet[:600]
+            rec["err_source"] = "summarizer"
+        try:
+            sink(rec)
+        except Exception:
+            pass
+
+    def _summarize_messages(self, msgs: list, existing_summary: str, auth_headers: dict, _depth: int = 0) -> str:
+        """把一组消息摘成滚动摘要;若摘要器仍以 "prompt is too long" 拒绝(分块预算估偏、既有摘要偏大、
+        内容 token 密度偏高等),就把消息二分递归续摘——上半段先摘,结果作为下半段的 existing_summary。
+        单条消息在 _messages_to_text 里已截到 ~4KB,递归到单条必然能塞下,故一定收敛。
+        作用:任何单块超限都能自愈,不再让「一块 400」把整次压缩拖垮(旧版的主要失败模式)。"""
+        text = self._messages_to_text(msgs)
+        try:
+            return self._summarize_chunk(text, existing_summary, auth_headers)
+        except RuntimeError as e:
+            too_long = "too long" in str(e).lower()
+            if too_long and len(msgs) > 1 and _depth < 16:
+                mid = len(msgs) // 2
+                log.warning(
+                    f"  summarizer rejected {len(text):,} chars / {len(msgs)} msgs as too long; "
+                    f"splitting {mid}+{len(msgs) - mid} and retrying (depth {_depth + 1})"
+                )
+                rolling = self._summarize_messages(msgs[:mid], existing_summary, auth_headers, _depth + 1)
+                rolling = self._summarize_messages(msgs[mid:], rolling, auth_headers, _depth + 1)
+                return rolling
+            raise
 
     def compress(self, messages: list, auth_headers: dict, real_token_count: int = None) -> tuple:
         """Compress messages using rolling summarization (synchronous)."""
@@ -452,31 +529,23 @@ class RollingCompressor:
         conversation_text = self._messages_to_text(to_compress)
         log.info(f"Compression request -> {self.summarizer_url}")
 
-        if len(conversation_text) <= SUMMARIZER_INPUT_CHAR_BUDGET:
-            # 常见路径:整段一次摘要,行为与 1.7.14 一致。
+        # 统一走「分块 + 逐块滚动续摘」:正文 ≤ 预算时就是单块,与旧版单次摘要等价;超预算则按时序
+        # 多块,每块把上一块摘要作为 existing_summary。每块再经 _summarize_messages 自适应二分兜底,
+        # 任一块即便仍超限也不会让整次压缩失败。
+        chunks = self._chunk_by_chars(to_compress, SUMMARIZER_INPUT_CHAR_BUDGET)
+        log.info(
+            f"Summarizing {len(to_compress)} messages ({len(conversation_text):,} chars) "
+            f"in {len(chunks)} chunk(s) (budget {SUMMARIZER_INPUT_CHAR_BUDGET:,} chars) "
+            f"with {self.summarizer_model}..."
+        )
+        rolling = existing_summary
+        for ci, chunk in enumerate(chunks, 1):
+            rolling = self._summarize_messages(chunk, rolling, auth_headers)
             log.info(
-                f"Summarizing {len(to_compress)} messages ({len(conversation_text):,} chars) "
-                f"with {self.summarizer_model}..."
+                f"  chunk {ci}/{len(chunks)}: {len(chunk)} msgs -> "
+                f"rolling summary {len(rolling):,} chars"
             )
-            new_summary = self._summarize_chunk(conversation_text, existing_summary, auth_headers)
-        else:
-            # giant 会话:to_compress 文本超摘要器窗口,按时序分块,逐块把上一块摘要作为
-            # existing_summary 续摘,得到一份整合的滚动摘要——避免一次塞爆 → 400 prompt too long。
-            chunks = self._chunk_by_chars(to_compress, SUMMARIZER_INPUT_CHAR_BUDGET)
-            log.info(
-                f"Summarizing {len(to_compress)} messages ({len(conversation_text):,} chars) "
-                f"in {len(chunks)} chunks (> {SUMMARIZER_INPUT_CHAR_BUDGET:,} char budget) "
-                f"with {self.summarizer_model}..."
-            )
-            rolling = existing_summary
-            for ci, chunk in enumerate(chunks, 1):
-                chunk_text = self._messages_to_text(chunk)
-                rolling = self._summarize_chunk(chunk_text, rolling, auth_headers)
-                log.info(
-                    f"  chunk {ci}/{len(chunks)}: {len(chunk)} msgs "
-                    f"({len(chunk_text):,} chars) -> rolling summary {len(rolling):,} chars"
-                )
-            new_summary = rolling
+        new_summary = rolling
 
         log.info(f"Summary generated: {len(new_summary):,} chars")
 

@@ -324,6 +324,8 @@ class CompressionStore:
             "pending": None,         # pending compression result
             "pending_hashes": None,  # hashes for pending
             "thread": None,          # background compression thread
+            "used": False,           # 是否已被某个请求注入过(用于标记「压缩生效的第一个请求」)
+            "pre_tokens": 0,         # 触发本次压缩时的上下文 token 数(压缩前规模,用于展示收缩效果)
         }
         with self._lock:
             self._compressions.append(entry)
@@ -343,6 +345,21 @@ store = CompressionStore()
 # 请求级统计采集器:每个真实 /v1/messages 生成调用记一条(token + 各类耗时),
 # 内存环形缓冲 + JSONL 落盘,供 /stats 看板读取。
 stats = StatsCollector()
+
+
+def _record_compression_call(rec: dict):
+    """compressor.stats_sink 回调:摘要器自己的 HTTP 调用不经过本代理的请求路径,
+    故由压缩器回灌一条记录。这里补上 ts/session(后台线程已 _set_sess 到发起会话)后入库,
+    让「压缩请求」也出现在 /stats(含 200000 超限这类摘要器 400)。"""
+    rec.setdefault("ts", time.time())
+    rec.setdefault("session", _get_sess())
+    try:
+        stats.record(rec)
+    except Exception as ex:
+        log.debug(f"[BG] compression stat record failed: {ex}")
+
+
+compressor.stats_sink = _record_compression_call
 
 # 并发检测:保存「在途」生成请求的 record 引用。任意时刻在途 >1 个,即把彼此都标记
 # concurrent —— 这样并发期内每个请求都带标记,看板可把并发吞吐与单请求吞吐分开统计。
@@ -822,6 +839,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Scan: do any stored compressions match this request's messages?
         match, match_end = store.find_match(msg_hashes, messages)
         injected = False
+        first_compressed = False   # 本请求是否「首次」用上某条新压缩(看板标记压缩生效点)
+        pre_compress_tokens = 0    # 该压缩对应的压缩前 token 规模(展示收缩效果)
 
         if match and match["prefix"] is not None and match_end > 0:
             # Replace everything up to match_end with the prefix
@@ -859,6 +878,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 payload["messages"] = merged
                 msg_chars = merged_chars
                 injected = True
+                # 该压缩条目第一次被注入 → 标记为「压缩生效的第一个请求」,并带上压缩前规模。
+                if not match.get("used"):
+                    match["used"] = True
+                    first_compressed = True
+                    pre_compress_tokens = match.get("pre_tokens", 0)
             else:
                 log.info(
                     f"[MSG] Compression no longer helps: "
@@ -884,6 +908,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "req_bytes": len(raw_body), "resp_bytes": 0, "injected": injected,
             "t_overhead_ms": 0, "t_prefill_ms": 0, "t_gen_ms": 0, "t_total_ms": 0,
             "concurrent": False, "stream_chunks": 0,
+            "kind": "request",  # 与 compressor 回灌的 kind=="compression" 区分
+            "first_compressed": first_compressed, "pre_tokens": pre_compress_tokens,
         }
         t_first = None
         t_fwd = t_recv
@@ -1045,6 +1071,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         f"Compressing in background..."
                     )
                     entry = store.add()
+                    entry["pre_tokens"] = total_input  # 压缩前规模,注入生效时展示收缩效果
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),

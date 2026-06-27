@@ -111,6 +111,8 @@ Chart.defaults.maintainAspectRatio = false;
 
 const charts = {};
 let state = { hours: '24' };
+let _bySession = [];           // 会话图 tooltip 用的实时引用(原地更新时闭包不会过期)
+const expandedRows = new Set(); // 已展开的错误明细行(按 ts),刷新后保持展开
 
 // ---- 格式化 ----
 function fmt(n){
@@ -185,10 +187,20 @@ function renderKpis(t, cfg){
   ].join('');
 }
 
-// ---- 通用建图 ----
+// ---- 通用建图:已存在则原地更新(局部刷新,不销毁重建、无闪烁);否则首次创建 ----
 function draw(id, config){
-  if (charts[id]) charts[id].destroy();
-  charts[id] = new Chart(document.getElementById(id), config);
+  const ex = charts[id];
+  if (ex){
+    ex.data.labels = config.data.labels;
+    config.data.datasets.forEach((ds, i)=>{
+      if (ex.data.datasets[i]) ex.data.datasets[i].data = ds.data;
+      else ex.data.datasets[i] = ds;
+    });
+    ex.data.datasets.length = config.data.datasets.length;
+    ex.update('none');  // 'none' = 不放动画,避免每 15s 刷新时图表跳动
+  } else {
+    charts[id] = new Chart(document.getElementById(id), config);
+  }
 }
 const gridX = { grid:{display:false}, ticks:{maxTicksLimit:10, autoSkip:true} };
 const gridY = { grid:{color:'#16202e'}, beginAtZero:true };
@@ -282,12 +294,14 @@ function renderCharts(d){
 
   // 按会话
   const ss = d.by_session;
+  _bySession = ss;  // 供 tooltip 读取最新值(原地更新不重建选项,闭包须指向全局)
   draw('cSession', {
     type:'bar',
     data:{ labels:ss.map(x=>x.session), datasets:[{ label:'token', data:ss.map(x=>x.total),
       backgroundColor:C.indigo }] },
     options:{ indexAxis:'y', scales:{x:{...gridY,ticks:{callback:fmt}}, y:{grid:{display:false}}},
-      plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>fmt(c.parsed.x)+' token · '+ss[c.dataIndex].requests+' 次'}}} }
+      plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>{
+        const row=_bySession[c.dataIndex]; return fmt(c.parsed.x)+' token'+(row?' · '+row.requests+' 次':''); }}}} }
   });
 }
 
@@ -295,6 +309,57 @@ function renderCharts(d){
 function esc(s){
   return String(s==null?'':s).replace(/[&<>"']/g, c=>(
     {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---- 点击错误行:切换明细 + 记住展开状态(刷新后不丢) ----
+function toggleRow(tr, key){
+  const d = tr.nextElementSibling;
+  if (!d) return;
+  const nowHidden = d.classList.toggle('hidden');
+  if (nowHidden) expandedRows.delete(key); else expandedRows.add(key);
+}
+
+// ---- Cloudflare 错误码 → 人话(CF 边缘错误响应体通常只有 "error code: NNNN") ----
+const CF_CODES = {
+  '1006':'IP 被站点封禁(Access denied)',
+  '1007':'IP 被站点封禁(Access denied)',
+  '1008':'IP 被站点封禁(Access denied)',
+  '1009':'按地区/国家封禁',
+  '1010':'客户端 TLS/浏览器签名被站点封禁 —— CF 认为发起方是被禁的客户端指纹(常见于非常规 UA、自动化或被风控的出口)',
+  '1015':'被 Cloudflare 限速(rate limited),退避后重试',
+  '1020':'命中站点的 CF 防火墙规则(Access denied)',
+  '1101':'上游 Worker 抛异常',
+  '1102':'上游 Worker 超出资源限制',
+};
+function cfHint(snippet){
+  if (!snippet) return '';
+  const m = String(snippet).match(/error code:\s*(\d{3,4})/i);
+  if (!m) return '';
+  const code = m[1];
+  return CF_CODES[code] ? `CF ${code}:${CF_CODES[code]}` : `Cloudflare 错误码 ${code}`;
+}
+
+// ---- 上游/Anthropic JSON 错误体 → 提取 .error.message 并翻成人话 ----
+// CF 错误体是纯文本 "error code: NNNN",JSON.parse 会失败 → 返回 null,交给 cfHint,两者不重叠。
+function apiErr(snippet){
+  if (!snippet) return null;
+  let msg = '';
+  try { const j = JSON.parse(snippet); msg = (j.error && j.error.message) || j.message || ''; }
+  catch(e){ const m = String(snippet).match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/); if (m) msg = m[1]; }
+  if (!msg) return null;
+  let hint = '';
+  const tl = msg.match(/prompt is too long:\s*([\d,]+)\s*tokens?\s*>\s*([\d,]+)/i);
+  if (tl){
+    hint = `请求 ${tl[1]} tokens 超出上游 ${tl[2]} 上限 —— 历史在压缩生效前就发到了上游。`
+         + `若 ${tl[2]} 是 200000,是摘要器(Haiku)那次调用超限;若是 1000000,是主请求未被压缩收缩。`;
+  } else if (/rate.?limit|too many requests|429/i.test(msg)){
+    hint = '被限速(429),客户端会退避重试';
+  } else if (/overloaded|529/i.test(msg)){
+    hint = '上游过载(529),稍后自动重试';
+  } else if (/invalid|authentication|401|403/i.test(msg)){
+    hint = '鉴权/参数被拒,检查 API key 与请求头透传';
+  }
+  return { msg, hint };
 }
 
 // ---- 最近请求表 ----
@@ -324,11 +389,29 @@ function renderRecent(rows){
     } else {
       tpsCell = `<span class="text-pink-300" title="${r.chunks?('数据块 '+r.chunks):''}">${r.tps}</span>`;
     }
+    const key = String(r.ts);
     const clickable = isErr ? ' cursor-pointer' : '';
-    const onclick = isErr ? ' onclick="this.nextElementSibling.classList.toggle(\'hidden\')"' : '';
+    const onclick = isErr ? ` onclick="toggleRow(this,'${key}')"` : '';
+    // 错误信息(JSON .error.message)抽出来:状态格 tooltip 悬停即见,不必展开。
+    const apiInfo = isErr ? apiErr(r.err_snippet) : null;
+    const stTitle = apiInfo && apiInfo.msg ? ` title="${esc(apiInfo.msg)}"` : '';
+    // 压缩可视化徽标:压缩器调用 / 压缩生效的第一个请求(带压缩前→后规模)。
+    let badges = '';
+    if (r.kind === 'compression'){
+      const cc = r.conv_chars ? ` title="摘要正文 ${fmt(r.conv_chars)} 字符 → 输出摘要 ${fmt(r.output)} tok"` : ' title="rolling-context 摘要器调用:压缩历史(非你的对话请求)"';
+      badges += ` <span class="px-1 rounded bg-violet-500/15 text-violet-300"${cc}>压缩</span>`;
+    }
+    if (r.first_compressed){
+      // 压缩「后」用本次请求的总输入(input+缓存读+缓存创建)——注入的压缩前缀多为缓存命中,
+      // 单看 input_tokens 会是个位数,会把 548K→2 这种误导值显示出来;总输入才与 pre_tokens 同口径。
+      const post = (r.input||0)+(r.cache_read||0)+(r.cache_create||0);
+      const drop = r.pre_tokens ? `${fmt(r.pre_tokens)}→${fmt(post)}` : '';
+      const pct = (r.pre_tokens && post) ? ` (${Math.round(post/r.pre_tokens*100)}%)` : '';
+      badges += ` <span class="px-1 rounded bg-emerald-500/15 text-emerald-300" title="压缩生效的第一个请求:本次请求总输入(含缓存)${drop?' '+drop+' tokens'+pct:' '+fmt(post)}">✂ 生效${drop?' '+drop:''}</span>`;
+    }
     let row = `<tr class="border-b border-slate-900 hover:bg-slate-900/50${clickable}"${onclick}>
       <td class="py-1.5 pr-3 text-slate-400 whitespace-nowrap font-mono">${fmtClock(r.ts)}</td>
-      <td class="py-1.5 pr-3 text-slate-300 whitespace-nowrap">${esc(r.model)}</td>
+      <td class="py-1.5 pr-3 text-slate-300 whitespace-nowrap">${esc(r.model)}${badges}</td>
       <td class="py-1.5 pr-3 text-slate-500 font-mono">${esc(r.session)}</td>
       <td class="py-1.5 pr-3 text-right">${fmt(r.input)}</td>
       <td class="py-1.5 pr-3 text-right text-slate-400">${fmt(r.cache_read)}</td>
@@ -339,7 +422,7 @@ function renderRecent(rows){
       <td class="py-1.5 pr-3 text-right">${fmtMs(r.total_ms)}</td>
       <td class="py-1.5 pr-3 text-center">${conc}</td>
       <td class="py-1.5 pr-3 text-center">${r.injected?'<span class="text-sky-400">✓</span>':'<span class="text-slate-700">·</span>'}</td>
-      <td class="py-1.5 pr-3 text-right font-mono ${stColor} whitespace-nowrap">${r.status||'—'}${srcBadge}</td>
+      <td class="py-1.5 pr-3 text-right font-mono ${stColor} whitespace-nowrap"${stTitle}>${r.status||'—'}${srcBadge}</td>
     </tr>`;
     // 错误行:追加一行可展开的「响应明细」(默认隐藏,点击错误行切换)。
     if (isErr){
@@ -351,9 +434,20 @@ function renderRecent(rows){
         r.err_retry_after?`retry-after=${esc(r.err_retry_after)}`:'',
       ].filter(Boolean).join('  ·  ');
       const bodyTxt = r.err_snippet ? esc(r.err_snippet) : '(未捕获响应体)';
-      row += `<tr class="hidden bg-slate-900/70">
+      const hint = cfHint(r.err_snippet);
+      const hintHtml = hint
+        ? `<div class="text-[11px] text-amber-300/90 mb-1">💡 ${esc(hint)}</div>` : '';
+      // JSON 错误体:把 .error.message 当作标题置顶,再给一行人话提示。
+      const msgHtml = apiInfo && apiInfo.msg
+        ? `<div class="text-[12px] text-rose-300 font-semibold mb-1 break-all">⚠ ${esc(apiInfo.msg)}</div>` : '';
+      const apiHintHtml = apiInfo && apiInfo.hint
+        ? `<div class="text-[11px] text-amber-300/90 mb-1">💡 ${esc(apiInfo.hint)}</div>` : '';
+      const open = expandedRows.has(key);  // 刷新后保持上次的展开状态
+      row += `<tr class="${open?'':'hidden '}bg-slate-900/70">
         <td colspan="13" class="py-2 px-3 border-b border-slate-800">
+          ${msgHtml}
           <div class="text-[11px] text-slate-400 font-mono mb-1">${meta}</div>
+          ${hintHtml}${apiHintHtml}
           <pre class="text-[11px] text-rose-200/90 font-mono whitespace-pre-wrap break-all max-h-48 overflow-auto">${bodyTxt}</pre>
         </td></tr>`;
     }
