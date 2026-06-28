@@ -1,5 +1,26 @@
 # ChangeLog
 
+## 1.15.1 — 摘要走 Haiku 时剥掉它不支持的 context-1m beta,修 summarizer 400
+
+### 背景
+1.15 后实测发现:CC 在 `model[1m]` 下会给请求带 `anthropic-beta: context-1m-2025-08-07` 头,而压缩器
+(`compressor.py`)的摘要请求 `headers = dict(auth_headers)` 原样透传了这个头。问题的本质是**只有 Haiku
+模型不支持 1M 长上下文 beta**,而摘要默认就走 Haiku;上游因此以
+`400 The long context beta is not yet available for this subscription` 拒掉,导致压缩失败。
+
+### 变更(`proxy/compressor.py`)
+- 新增 `_model_supports_1m(model)`:Haiku 判不支持,其余在用模型(Opus 4.x / Sonnet 4.6 / Fable)支持。
+- 新增 `_strip_unsupported_1m_beta(headers, model)`:**当目标模型不支持 1M 时**,原地从 `anthropic-beta`
+  剥掉 `context-1m` token、保留其余 beta(如 fine-grained-tool-streaming);剥空则删掉该头。判定挂在模型
+  上,而非「因为是摘要请求」。
+- `_summarize_chunk` 构造摘要请求头后以 `self.summarizer_model` 调用它。**主代理路径不动**——真实 1M
+  请求(Opus 等支持 1M 的模型)照常带头走上游。
+
+### 实测(2026-06-28)
+`proxy/test_compressor.py` 新增 `StripUnsupported1mBeta`:Haiku 只剥 context-1m / 仅含则删头 / 支持 1M
+的模型(opus)原样保留 / 头名大小写 / 无头 noop / `_summarize_chunk` 出站请求确不含 anthropic-beta,
+共 6 例。全套 `test_compressor` + `test_emergency` + `test_stats` 合计 **47 例全绿**。
+
 ## 1.15.0 — 按请求头判定真实上下文窗口,有效 trigger 自动夹到窗口之下
 
 ### 背景

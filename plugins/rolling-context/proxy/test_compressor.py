@@ -67,5 +67,51 @@ class EmptyContentGuard(unittest.TestCase):
         self.assertEqual(c._summarize_chunk("hi", "", {}), "SUMMARY")
 
 
+class StripUnsupported1mBeta(unittest.TestCase):
+    """判定挂在模型上:Haiku 不支持 1M → 剥掉 context-1m(保留其余 beta);支持 1M 的模型原样保留。"""
+
+    def test_haiku_removes_context_1m_only(self):
+        h = {"anthropic-beta": "fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07"}
+        compressor._strip_unsupported_1m_beta(h, "claude-haiku-4-5-20251001")
+        self.assertEqual(h["anthropic-beta"], "fine-grained-tool-streaming-2025-05-14")
+
+    def test_haiku_drops_header_when_only_context_1m(self):
+        h = {"anthropic-beta": "context-1m-2025-08-07"}
+        compressor._strip_unsupported_1m_beta(h, "claude-haiku-latest")
+        self.assertNotIn("anthropic-beta", h)
+
+    def test_1m_capable_model_keeps_beta(self):
+        h = {"anthropic-beta": "context-1m-2025-08-07"}
+        compressor._strip_unsupported_1m_beta(h, "claude-opus-4-8")
+        self.assertEqual(h["anthropic-beta"], "context-1m-2025-08-07", "支持 1M 的模型必须原样保留")
+
+    def test_header_name_case_insensitive(self):
+        h = {"Anthropic-Beta": "Context-1M-2025-08-07,foo-bar"}
+        compressor._strip_unsupported_1m_beta(h, "claude-haiku-latest")
+        self.assertEqual(h["Anthropic-Beta"], "foo-bar")
+
+    def test_no_beta_header_is_noop(self):
+        h = {"content-type": "application/json"}
+        compressor._strip_unsupported_1m_beta(h, "claude-haiku-latest")
+        self.assertEqual(h, {"content-type": "application/json"})
+
+    def test_summarize_chunk_strips_beta_from_outgoing_request(self):
+        captured = {}
+
+        class _CapConn:
+            def request(self, method, path, body=None, headers=None):
+                captured.update(headers or {})
+            def getresponse(self):
+                return _FakeResp(200, json.dumps(
+                    {"content": [{"type": "text", "text": "S"}], "usage": {}}).encode())
+            def close(self):
+                pass
+
+        c = compressor.RollingCompressor()
+        c._conn = lambda: _CapConn()
+        c._summarize_chunk("hi", "", {"anthropic-beta": "context-1m-2025-08-07"})
+        self.assertNotIn("anthropic-beta", {k.lower(): v for k, v in captured.items()})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

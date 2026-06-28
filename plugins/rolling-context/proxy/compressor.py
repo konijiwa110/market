@@ -39,6 +39,27 @@ _SUMMARIZER_SCHEME = _parsed_summarizer.scheme
 _SUMMARIZER_PATH = _parsed_summarizer.path or ""
 
 
+def _model_supports_1m(model: str) -> bool:
+    """该模型是否支持 1M 长上下文 beta(context-1m)。Haiku 不支持;其余在用模型
+    (Opus 4.x / Sonnet 4.6 / Fable)支持。"""
+    return "haiku" not in (model or "").lower()
+
+
+def _strip_unsupported_1m_beta(headers: dict, model: str) -> None:
+    """当目标模型不支持 1M 时,原地从 anthropic-beta 剥掉 context-1m token、保留其余 beta;剥空则删头。
+    判定挂在模型上(只有 Haiku 不支持),不是「因为是摘要请求」。摘要默认走 Haiku,而 CC 在 model[1m]
+    下透传的 context-1m 头会被上游以「long context beta not available」400 拒;支持 1M 的模型原样保留。"""
+    if _model_supports_1m(model):
+        return
+    for hk in [k for k in headers if k.lower() == "anthropic-beta"]:
+        kept = [t.strip() for t in str(headers[hk]).split(",")
+                if t.strip() and "context-1m" not in t.lower()]
+        if kept:
+            headers[hk] = ",".join(kept)
+        else:
+            headers.pop(hk)
+
+
 def _summarizer_conn():
     """Create a connection to the summarizer server (same style as server.py)."""
     if _SUMMARIZER_SCHEME == "https":
@@ -408,6 +429,7 @@ class RollingCompressor:
             headers.pop(k)
         headers["content-length"] = str(len(req_body))
         headers["accept-encoding"] = "identity"
+        _strip_unsupported_1m_beta(headers, self.summarizer_model)  # Haiku 不支持 1M,透传会被上游 400 拒
 
         summarizer_path = _join_path(self._summ_path, "/v1/messages")
 
