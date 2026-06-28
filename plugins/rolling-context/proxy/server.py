@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import sys
+import gzip
 import time
 import logging
 import logging.handlers
@@ -191,6 +192,16 @@ EMERGENCY_COMPRESS = str(_cfg("emergency_compress", "ROLLING_CONTEXT_EMERGENCY_C
 # 与 EMERGENCY_COMPRESS 正交:emergency 是上游 400 后的被动兜底,proactive 是 400 之前的主动预压。
 # 默认开;设 0/false/off 关闭,回到「先全量发、后台压」的旧行为。
 PROACTIVE_COMPRESS = str(_cfg("proactive_compress", "ROLLING_CONTEXT_PROACTIVE_COMPRESS", "1")).lower() not in ("0", "false", "off", "no")
+
+# 大请求归档(便于事后审查「它到底输出了啥」):对大输出或长耗时的回合,把完整请求体 + 完整响应内容
+# 单独落一份 gzip 存档。透传字节流不动,只读 buffer 副本;归档在响应已全量回给 CC、落库之前触发,
+# 失败绝不影响请求。总量滚动封顶防无界增长。默认开;设 0/false/off 关闭。
+ARCHIVE = str(_cfg("archive", "ROLLING_CONTEXT_ARCHIVE", "1")).lower() not in ("0", "false", "off", "no")
+# 归档触发阈值:输出 token 数 ≥ MIN_OUT 或 总耗时(ms)≥ MIN_MS,任一即归档。两者皆可配。
+ARCHIVE_MIN_OUT = int(_cfg("archive_min_out", "ROLLING_CONTEXT_ARCHIVE_MIN_OUT", 8000))
+ARCHIVE_MIN_MS = int(_cfg("archive_min_ms", "ROLLING_CONTEXT_ARCHIVE_MIN_MS", 90000))
+# 归档目录总量上限(MB):每次写入后若超限,按修改时间删最旧直到回落到上限之下。
+ARCHIVE_CAP_MB = int(_cfg("archive_cap_mb", "ROLLING_CONTEXT_ARCHIVE_CAP_MB", 200))
 
 ssl_ctx = ssl.create_default_context()
 _parsed_upstream = urlparse(UPSTREAM_URL)
@@ -593,6 +604,209 @@ def _record_compression_call(rec: dict):
 
 compressor.stats_sink = _record_compression_call
 
+
+# ── 输出明细拆分 + 大请求归档 ──────────────────────────────────────────────
+# proxy 透明转发、不解析 SSE,故 output_tokens 只是上游回报的总量,不知 thinking/text/tool_use 各占多少。
+# 下面在响应已全量回给 CC 之后,从 buffer 副本解析出三段明细 + 可读内容块;超阈值的回合再整份归档备查。
+
+_ARCHIVE_DIR = os.path.join(_CLAUDE_DIR, "rolling-context-archive")
+
+
+def _bucket_of(block_type: str) -> str:
+    """内容块 type → 三段桶。"""
+    if block_type in ("thinking", "redacted_thinking"):
+        return "thinking"
+    if block_type in ("tool_use", "server_tool_use"):
+        return "tool_use"
+    return "text"
+
+
+def _finalize_blocks(by_index: dict):
+    """把 {index:{type,parts,name?}} 收成 (有序可读块列表, 三段字符数)。"""
+    blocks = []
+    bd = {"thinking": 0, "text": 0, "tool_use": 0}
+    for idx in sorted(by_index):
+        slot = by_index[idx]
+        txt = "".join(slot.get("parts", []))
+        t = slot.get("type") or "text"
+        blk = {"type": t, "text": txt}
+        if slot.get("name"):
+            blk["name"] = slot["name"]
+        blocks.append(blk)
+        bd[_bucket_of(t)] += len(txt)
+    return blocks, bd
+
+
+def _parse_output_blocks(buffer_text: str):
+    """从流式 SSE 缓冲解析出有序内容块 + 三段字符数。一趟扫描,容错跳过坏行。"""
+    by_index = {}
+    for line in buffer_text.split("\n"):
+        if not line.startswith("data: "):
+            continue
+        data_str = line[6:]
+        if data_str == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        et = data.get("type", "")
+        if et == "content_block_start":
+            idx = data.get("index", 0)
+            cb = data.get("content_block", {}) or {}
+            slot = {"type": cb.get("type", ""), "parts": []}
+            if cb.get("type") in ("tool_use", "server_tool_use") and cb.get("name"):
+                slot["name"] = cb.get("name")
+            by_index[idx] = slot
+        elif et == "content_block_delta":
+            idx = data.get("index", 0)
+            d = data.get("delta", {}) or {}
+            dt = d.get("type", "")
+            slot = by_index.setdefault(idx, {"type": "", "parts": []})
+            if dt == "text_delta":
+                slot["type"] = slot["type"] or "text"
+                slot["parts"].append(d.get("text", ""))
+            elif dt == "thinking_delta":
+                slot["type"] = slot["type"] or "thinking"
+                slot["parts"].append(d.get("thinking", ""))
+            elif dt == "input_json_delta":
+                slot["type"] = slot["type"] or "tool_use"
+                slot["parts"].append(d.get("partial_json", ""))
+            elif dt == "signature_delta":
+                slot["type"] = slot["type"] or "thinking"  # thinking 签名,不计入可读正文
+    return _finalize_blocks(by_index)
+
+
+def _parse_output_blocks_json(data: dict):
+    """从非流式 JSON 响应的 content 数组解析出有序内容块 + 三段字符数。"""
+    by_index = {}
+    for i, cb in enumerate(data.get("content", []) or []):
+        t = cb.get("type", "")
+        if t == "text":
+            txt = cb.get("text", "")
+        elif t == "thinking":
+            txt = cb.get("thinking", "")
+        elif t == "redacted_thinking":
+            txt = cb.get("data", "")
+        elif t in ("tool_use", "server_tool_use"):
+            txt = json.dumps(cb.get("input", {}), ensure_ascii=False)
+        else:
+            txt = ""
+        slot = {"type": t or "text", "parts": [txt]}
+        if cb.get("name"):
+            slot["name"] = cb["name"]
+        by_index[i] = slot
+    return _finalize_blocks(by_index)
+
+
+def _archive_dir() -> str:
+    try:
+        os.makedirs(_ARCHIVE_DIR, exist_ok=True)
+    except Exception:
+        pass
+    return _ARCHIVE_DIR
+
+
+def _should_archive(record: dict) -> bool:
+    """大输出或长耗时的真实生成回合才归档(压缩器自身调用、count 探测不归档)。"""
+    if not ARCHIVE or record.get("kind") != "request":
+        return False
+    return ((record.get("output_tokens", 0) or 0) >= ARCHIVE_MIN_OUT
+            or (record.get("t_total_ms", 0) or 0) >= ARCHIVE_MIN_MS)
+
+
+def _redact(obj):
+    """递归抹掉疑似密钥(归档请求体兜底脱敏;auth 本在 header 不在 body,这是双保险)。"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and k.lower() in ("authorization", "x-api-key", "api_key", "apikey"):
+                out[k] = "<redacted>"
+            else:
+                out[k] = _redact(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact(x) for x in obj]
+    if isinstance(obj, str) and obj.startswith("sk-") and len(obj) > 20:
+        return "<redacted>"
+    return obj
+
+
+def _prune_archive_dir(cap_bytes: int):
+    """归档目录总量超 cap 则按修改时间删最旧,直到回落到 cap 之下。"""
+    try:
+        entries = []
+        total = 0
+        for name in os.listdir(_ARCHIVE_DIR):
+            if not name.endswith(".json.gz"):
+                continue
+            p = os.path.join(_ARCHIVE_DIR, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+        if total <= cap_bytes:
+            return
+        entries.sort()  # 最旧的 mtime 在前
+        for _mtime, size, p in entries:
+            if total <= cap_bytes:
+                break
+            try:
+                os.remove(p)
+                total -= size
+            except OSError:
+                pass
+    except Exception as e:
+        log.debug(f"[MSG] archive prune failed: {e}")
+
+
+def _write_archive(record: dict, payload: dict, out_blocks: list, error_snippet=None):
+    """把一份完整请求 + 响应内容落 gzip 存档,文件名记回 record['archive_file'];写完按总量封顶清理。"""
+    try:
+        d = _archive_dir()
+        sess = record.get("session", "--------")
+        out = record.get("output_tokens", 0) or 0
+        tot = record.get("t_total_ms", 0) or 0
+        ts = record.get("ts", time.time())
+        fname = f"{ts:.0f}-{sess}-{out}tok-{tot:.0f}ms.json.gz"
+        fpath = os.path.join(d, fname)
+        doc = {
+            "meta": {
+                "ts": ts,
+                "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+                "model": record.get("model"),
+                "session": sess,
+                "status": record.get("status"),
+                "usage": {k: record.get(k, 0) for k in
+                          ("input_tokens", "cache_read", "cache_create", "output_tokens")},
+                "timing_ms": {k: record.get(k, 0) for k in
+                              ("t_overhead_ms", "t_prefill_ms", "t_gen_ms", "t_total_ms")},
+                "output_breakdown_chars": {
+                    "thinking": record.get("out_thinking_chars", 0),
+                    "text": record.get("out_text_chars", 0),
+                    "tool_use": record.get("out_tool_chars", 0),
+                },
+                "flags": {k: record.get(k) for k in
+                          ("injected", "prewarm", "emergency", "first_compressed", "concurrent")},
+                "stream_chunks": record.get("stream_chunks", 0),
+            },
+            "request": _redact(payload),
+            "response": {"status": record.get("status"), "blocks": out_blocks},
+        }
+        if error_snippet:
+            doc["response"]["error"] = error_snippet
+        with gzip.open(fpath, "wt", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        record["archive_file"] = fname
+        _prune_archive_dir(ARCHIVE_CAP_MB * 1024 * 1024)
+        log.info(f"[MSG] Archived big/slow request -> {fname}")
+        return fname
+    except Exception as e:
+        log.debug(f"[MSG] archive write failed: {e}")
+        return None
+
 # 并发检测:保存「在途」生成请求的 record 引用。任意时刻在途 >1 个,即把彼此都标记
 # concurrent —— 这样并发期内每个请求都带标记,看板可把并发吞吐与单请求吞吐分开统计。
 _inflight_lock = threading.Lock()
@@ -912,6 +1126,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._handle_stats_page()
         elif normalized_path == "/stats/data":
             self._handle_stats_data(parsed)
+        elif normalized_path == "/stats/archive":
+            self._handle_archive_list()
+        elif normalized_path == "/stats/archive/get":
+            self._handle_archive_get(parsed)
         else:
             self._proxy_raw("GET")
 
@@ -1043,6 +1261,58 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        self.send_response(200)
+        self.send_header("content-type", "application/json; charset=utf-8")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json; charset=utf-8")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_archive_list(self):
+        """列出归档文件(名/大小/mtime),供 dashboard 的归档查看用。"""
+        items = []
+        try:
+            for name in os.listdir(_ARCHIVE_DIR):
+                if not name.endswith(".json.gz"):
+                    continue
+                try:
+                    st = os.stat(os.path.join(_ARCHIVE_DIR, name))
+                except OSError:
+                    continue
+                items.append({"name": name, "size": st.st_size, "mtime": st.st_mtime})
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+            return
+        items.sort(key=lambda x: x["mtime"], reverse=True)
+        self._send_json({"dir": _ARCHIVE_DIR, "cap_mb": ARCHIVE_CAP_MB, "items": items})
+
+    def _handle_archive_get(self, parsed):
+        """解压并返回单个归档文件的 JSON。name 仅取 basename 防目录穿越。"""
+        qs = parse_qs(parsed.query)
+        name = os.path.basename((qs.get("name", [""])[0] or ""))
+        if not name.endswith(".json.gz"):
+            self._send_json({"error": "bad name"}, status=400)
+            return
+        fpath = os.path.join(_ARCHIVE_DIR, name)
+        if not os.path.isfile(fpath):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        try:
+            with gzip.open(fpath, "rt", encoding="utf-8") as f:
+                raw = f.read()
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+            return
+        body = raw.encode("utf-8")
         self.send_response(200)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(body)))
@@ -1213,6 +1483,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }
         t_first = None
         t_fwd = t_recv
+        # 输出明细 + 归档:在 try 内填充(流式解析后),finally 统一判阈值落档。预置默认值,
+        # 即便上游连接异常提前抛出,finally 也能安全引用。
+        out_blocks = []
+        out_breakdown = {"thinking": 0, "text": 0, "tool_use": 0}
+        archive_err = None
 
         # 注册在途(仅真实生成请求;count_tokens 探测不计入并发)。
         if not is_count:
@@ -1382,6 +1657,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 log.warning("[MSG] No usage tokens found in response")
 
+            # 解析输出明细(thinking/text/tool_use 三段)+ 可读内容块,供 stats 透出与归档复用。
+            # 只读 buffer 副本,不动透传字节流;容错包死,失败不影响请求与落库。
+            try:
+                if is_streaming and buffer:
+                    out_blocks, out_breakdown = _parse_output_blocks(
+                        buffer.decode("utf-8", errors="replace"))
+                elif not is_streaming and buffer:
+                    out_blocks, out_breakdown = _parse_output_blocks_json(json.loads(buffer))
+            except Exception as e:
+                log.debug(f"[MSG] output breakdown parse failed: {e}")
+            # 错误响应:留一段错误体片段进归档(便于审 502/524/空响应到底回了啥)。
+            if resp.status >= 400 and buffer:
+                archive_err = buffer.decode("utf-8", errors="replace")[:2000]
+
             # 错误响应(>=400)记录来源指纹,判定是 Cloudflare 边缘还是上游(sub2api)origin 生成。
             if resp.status >= 400:
                 _capture_error_source(record, resp, buffer)
@@ -1397,6 +1686,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             record["cache_read"] = usage_info["cache_read"]
             record["cache_create"] = usage_info["cache_create"]
             record["output_tokens"] = usage_info["output"]
+            record["out_thinking_chars"] = out_breakdown.get("thinking", 0)
+            record["out_text_chars"] = out_breakdown.get("text", 0)
+            record["out_tool_chars"] = out_breakdown.get("tool_use", 0)
             record["t_overhead_ms"] = round((t_fwd - t_recv) * 1000, 1)
             if t_first is not None:
                 record["t_prefill_ms"] = round((t_first - t_fwd) * 1000, 1)
@@ -1458,6 +1750,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if record["status"] == 0:
                 record["status"] = 502
             record["t_total_ms"] = round((time.perf_counter() - t_recv) * 1000, 1)
+            if archive_err is None:
+                archive_err = f"upstream connection error: {e}"
             error_body = json.dumps({"error": str(e)}).encode()
             self.send_response(502)
             self.send_header("content-type", "application/json")
@@ -1472,6 +1766,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         _inflight.remove(record)
                     except ValueError:
                         pass
+                # 大输出/长耗时回合整份归档备查(响应已回完,不增可感延迟;失败绝不影响落库)。
+                try:
+                    if _should_archive(record):
+                        _write_archive(record, payload, out_blocks, error_snippet=archive_err)
+                except Exception as ex:
+                    log.debug(f"[MSG] archive failed: {ex}")
                 try:
                     stats.record(record)
                 except Exception as ex:

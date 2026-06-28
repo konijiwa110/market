@@ -1,5 +1,44 @@
 # ChangeLog
 
+## 1.17.0 — 输出明细拆分(thinking/text/tool_use)+ 大输出/长耗时回合整份归档备查
+
+### 背景
+排查"为什么有些请求 >100s、输出 10 多 k 但我没感知"时发现:proxy 透明转发、不解析 SSE 内容块,`output_tokens`
+只是上游回报的**总量**,无从知道这 10k 里**思考(thinking)/ 正文(text)/ 工具调用(tool_use)** 各占多少——
+七成慢请求其实是上游用 ~75 tok/s 真吐了 7k~30k token,大头是 thinking + 工具调用(重 agentic 回合),可见正文很短,
+所以"没感知"。同时这些大输出/长耗时回合的**完整内容当下无处可查**,事后想审"它到底输出了啥"只能干瞪眼。
+
+### 变更
+**输出明细拆分(`proxy/server.py` + `proxy/stats.py` + `dashboard.html`)**
+- 流式响应已全量回给 CC 后,从 `buffer` 副本一趟解析 SSE 内容块:按 `content_block_start` 的 `index→type` +
+  `content_block_delta`(`thinking_delta`/`text_delta`/`input_json_delta`/`signature_delta`)累加各段字符数,
+  同时攒出有序可读块。抽成纯函数 `_parse_output_blocks`(流式)/ `_parse_output_blocks_json`(非流式)。
+- `record` 新增 `out_thinking_chars` / `out_text_chars` / `out_tool_chars`;`stats.recent[]` 透出 `out_thinking`/
+  `out_text`/`out_tool`。只读 buffer 副本,不动透传字节流;解析失败包死、不影响请求与落库。
+- dashboard 最近请求表新增「明细」列:`💭thinking% 📝text% 🔧tool%` 占比,tooltip 给近似 token 数(字符/4)。
+
+**大请求归档(`proxy/server.py`)**
+- 对大输出或长耗时的真实生成回合,把**完整请求体 + 完整响应内容**单独落一份 `*.json.gz` 存档(`meta` 含
+  usage/计时/flags/三段明细,`request` 全量,`response` 重建的可读内容块;错误回合附错误体片段)。
+- 触发:`_should_archive` —— `output_tokens ≥ ARCHIVE_MIN_OUT` 或 `t_total_ms ≥ ARCHIVE_MIN_MS`,任一即归档
+  (out=0 的 502/524/空响应若超时长阈值也归档,请求体 + 错误指纹照样可审)。压缩器自身调用、count 探测不归档。
+- 落在响应已回完之后(`finally` 内、`stats.record` 之前),不增可感延迟;整段 `try/except` 包死,**归档失败绝不
+  影响请求或落库**。`payload` 兜底递归脱敏(抹 `authorization`/`x-api-key`/`sk-` 串;auth 本在 header 不在 body)。
+- 空间封顶:`_prune_archive_dir` 每次写入后按总量(`ARCHIVE_CAP_MB`,默认 200)删最旧文件,回落到上限之下。
+- 配置(全走 `_cfg`,默认开,可环境变量覆盖):`ROLLING_CONTEXT_ARCHIVE` / `_ARCHIVE_MIN_OUT`(8000)/
+  `_ARCHIVE_MIN_MS`(90000)/ `_ARCHIVE_CAP_MB`(200)。
+
+**归档查看(`dashboard.html` + 两个 GET 路由)**
+- `/stats/archive` 列归档文件(名/大小/mtime);`/stats/archive/get?name=<file>` 校验 basename 防穿越、
+  `gzip` 解压回 JSON。dashboard 最近表新增「存档」列,有存档的行给 📄 链接,点开即看完整请求 + 响应。
+
+### 测试
+- 新增 `proxy/test_archive.py`(11 例):明细解析(流式三段 / signature 归 thinking 不计正文 / 非流式 / 坏行跳过)、
+  `_should_archive` 阈值边界(输出 / 时长 / 双不达 / 压缩 kind / 关闭)、`_write_archive` 脱敏 + gzip 往返、
+  `_prune_archive_dir` 按总量删最旧留最新。导入隔离:bind 自己的 temp state-dir 后从 `sys.modules` 摘除 + 复原 env,
+  保留原导入拓扑(不破坏 test_emergency 的 STATE_DIR 隔离断言)。
+- 全套 63 → **74 passed**。
+
 ## 1.16.0 — 转发前主动同步压缩消除 resume 冷启动卡顿;修 PowerShell UTF-8 读取腐化 settings.json
 
 ### 背景

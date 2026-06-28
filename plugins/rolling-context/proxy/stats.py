@@ -349,6 +349,11 @@ class StatsCollector:
                 "first_compressed": bool(r.get("first_compressed")),
                 "pre_tokens": r.get("pre_tokens", 0) or 0,
                 "conv_chars": r.get("conv_chars", 0) or 0,
+                # 输出明细(thinking/text/tool_use 字符数)+ 是否已整份归档(有文件名则可点开审查)。
+                "out_thinking": r.get("out_thinking_chars", 0) or 0,
+                "out_text": r.get("out_text_chars", 0) or 0,
+                "out_tool": r.get("out_tool_chars", 0) or 0,
+                "archive_file": r.get("archive_file", "") or "",
             })
 
         return {
