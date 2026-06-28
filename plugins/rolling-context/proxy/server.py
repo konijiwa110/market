@@ -185,6 +185,12 @@ APIKEY = _cfg("apikey", "ROLLING_CONTEXT_APIKEY", "")
 # CC 端永不看到这发 400(也让 CC 自己的 autoCompact/`/compact` 那发超限摘要请求被压住、得以成功,
 # 把真实 transcript 焊小 → 停插件后也不再全量重跑)。默认开;设 0/false/off 关闭回到旧的裸发行为。
 EMERGENCY_COMPRESS = str(_cfg("emergency_compress", "ROLLING_CONTEXT_EMERGENCY_COMPRESS", "1")).lower() not in ("0", "false", "off", "no")
+# 主动同步压缩(消除 resume 冷启动卡顿):未命中缓存的大请求,在「转发上游之前」就按请求体大小估算 token,
+# 若超有效 trigger 则当场同步压一次、把压缩结果换进请求体再转发——而非先全量发、再后台压(那样第一发要
+# 等慢上游嚼完整全量 transcript,且账单按全量计)。压完即登记进 store,后续请求直接命中、不再付同步延迟。
+# 与 EMERGENCY_COMPRESS 正交:emergency 是上游 400 后的被动兜底,proactive 是 400 之前的主动预压。
+# 默认开;设 0/false/off 关闭,回到「先全量发、后台压」的旧行为。
+PROACTIVE_COMPRESS = str(_cfg("proactive_compress", "ROLLING_CONTEXT_PROACTIVE_COMPRESS", "1")).lower() not in ("0", "false", "off", "no")
 
 ssl_ctx = ssl.create_default_context()
 _parsed_upstream = urlparse(UPSTREAM_URL)
@@ -478,6 +484,22 @@ class CompressionStore:
                 return
         log.debug(f"[MATCH] No match among {len(self._compressions)} stored compression(s)")
 
+    def covers(self, msg_hashes: list) -> bool:
+        """库里是否已有压缩(已转正的 original_hashes,或刚算完待转正的 pending_hashes)其哈希链出现在
+        msg_hashes 中。只读、不改状态。用途:在途的慢全量请求(发出时压缩还没就绪 → 没注入、原样发)
+        回来时,覆盖它的压缩往往已完成入库,下一发就会注入它;此时不应再触发一条近乎重复的新压缩。
+        同时查 pending 是为了关掉「压缩已完成但尚未被下一发 promote」的那段窗口。"""
+        with self._lock:
+            for entry in self._compressions:
+                oh = entry["original_hashes"] or entry.get("pending_hashes")
+                if not oh:
+                    continue
+                chain_len = len(oh)
+                for start in range(len(msg_hashes) - chain_len + 1):
+                    if msg_hashes[start:start + chain_len] == oh:
+                        return True
+        return False
+
     def add(self) -> dict:
         entry = {
             "original_hashes": [],   # hashes of original messages we replaced
@@ -689,22 +711,17 @@ def _effective_trigger(req_headers: dict) -> int:
     return min(TRIGGER_TOKENS, int(_request_window(req_headers) * TRIGGER_SAFETY))
 
 
-def _request_window(req_headers: dict) -> int:
-    """判出本请求的真实上下文窗口上限(token)。config 的 context_window 显式覆盖优先(供第三方上游
-    谎报 1M 时钉死);否则读 anthropic-beta 头:含 context-1m → 1M,否则 200k。req_headers 是原始
-    大小写 dict,故 .lower() 做大小写无关匹配。"""
-    if CONTEXT_WINDOW_OVERRIDE > 0:
-        return CONTEXT_WINDOW_OVERRIDE
-    for k, v in req_headers.items():
-        if k.lower() == "anthropic-beta" and _BETA_1M_MARK in (v or "").lower():
-            return WINDOW_1M
-    return WINDOW_DEFAULT
+def _estimate_body_tokens(raw_body_len: int) -> int:
+    """从原始请求体字节数粗估 token。整体口径(含 system+tools+messages),与 breakdown 日志同除数 4。
+    偏低估(JSON 结构使字节/token 高于纯文本),故据此判「超 trigger」是保守的:只在请求确实很大时才触发。"""
+    return raw_body_len // 4
 
 
-def _effective_trigger(req_headers: dict) -> int:
-    """主动压缩的有效阈值:不超过真实窗口×安全余量,避免 trigger 配超导致永不触发、撞墙吃 400。
-    正常配置(trigger 已低于该值)不受影响,只在配超时才夹紧。"""
-    return min(TRIGGER_TOKENS, int(_request_window(req_headers) * TRIGGER_SAFETY))
+def _should_proactive_compress(raw_body_len: int, req_headers: dict, is_count: bool, injected: bool) -> bool:
+    """是否在转发前主动同步压缩:开关开 + 非 count 探测 + 未命中缓存(否则已是小请求) + 粗估超有效 trigger。"""
+    if not PROACTIVE_COMPRESS or is_count or injected:
+        return False
+    return _estimate_body_tokens(raw_body_len) > _effective_trigger(req_headers)
 
 
 def _validate_tool_pairs(messages: list) -> list:
@@ -1147,6 +1164,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # Save current state for post-response compression trigger
         current_messages = payload.get("messages", messages)
 
+        # 主动同步压缩:未命中缓存的大请求,在转发上游【之前】就按请求体大小估算 token,超有效 trigger 就
+        # 当场同步压一次、把结果换进请求体再发——而非先全量发、再后台压。专治 resume 冷启动那发:旧路径要
+        # 先把全量 transcript 打给慢上游(缓存全冷,可达数十秒~数分钟,用户以为卡死),且账单按全量计;主动
+        # 压后第一发即缩到 target 上下,且压缩条目当场登记进 store,后续请求直接命中、不再付这次同步延迟。
+        prewarm = False
+        proactive_entry = None
+        if _should_proactive_compress(len(raw_body), req_headers, is_count, injected):
+            est_tokens = _estimate_body_tokens(len(raw_body))
+            log.info(
+                f"[MSG] Proactive compress: ~{est_tokens:,} est tokens (body {len(raw_body):,} B) "
+                f"> trigger {_effective_trigger(req_headers):,}, no cache hit — compressing before forward"
+            )
+            new_msgs = None
+            try:
+                # reported 传 body 粗估(比 msg_chars//3 更贴近真实,含 system+tools),供压缩器定 keep 比例。
+                new_msgs, proactive_entry = _emergency_compress(
+                    current_messages, auth_headers, est_tokens, msg_chars
+                )
+            except Exception as ex:
+                log.error(f"[MSG] Proactive compression failed: {ex}", exc_info=True)
+            if new_msgs is not None:
+                _remark_cache_breakpoints(new_msgs)
+                payload["messages"] = new_msgs
+                current_messages = new_msgs
+                msg_chars = compressor._count_chars(new_msgs)
+                injected = True
+                prewarm = True
+
         # Forward request — strip Accept-Encoding so we get plain text SSE
         body = json.dumps(payload).encode()
         headers = _forward_headers(req_headers, body, strip_encoding=True)
@@ -1164,6 +1209,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "kind": "request",  # 与 compressor 回灌的 kind=="compression" 区分
             "first_compressed": first_compressed, "pre_tokens": pre_compress_tokens,
             "emergency": False,  # 是否走了「超限→同步压缩重试」兜底
+            "prewarm": prewarm,  # 是否走了「转发前主动同步压缩」(resume 冷启动提速)
         }
         t_first = None
         t_fwd = t_recv
@@ -1191,7 +1237,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 那发超限摘要请求得以成功,把真实 transcript 焊小。最多重试一发,压不动/仍失败则原样回 400。
             prebuffered = None  # 非重试的 400:已读出的错误体,直接回给 CC(不再走流式读取)
             emergency_entry = None  # 同步兜底登记的条目;随后若触发后台压缩,用它当父条目回收
-            if EMERGENCY_COMPRESS and not is_count and not injected and resp.status == 400:
+            # prewarm 的请求虽已 injected,但主动压缩按粗估定的 keep 比例可能偏松、压后仍超限;放行让它再走
+            # 一次 emergency,用 400 体里上游自报的真实 token 数重压,保住「CC 永不见 400」的兜底。命中真实
+            # 压缩条目(match)而 injected 的请求不放行——那已是 known-good 尺寸,无需二次压。
+            if EMERGENCY_COMPRESS and not is_count and (not injected or prewarm) and resp.status == 400:
                 err_preview = resp.read()  # 400 体很小
                 conn.close()
                 if _looks_too_long(err_preview):
@@ -1371,7 +1420,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     e["thread"] is not None and e["thread"].is_alive()
                     for e in store.compressions
                 )
-                if not already_compressing:
+                # 去重:仅对「未注入」的请求做覆盖判定。在途的慢全量请求发出时压缩还没就绪 → 没注入、原样
+                # 发到上游,回来时 total_input 仍是旧的全量值、又超 trigger;但覆盖它的压缩此刻往往已完成入库
+                # (下一发就会注入),不应再压一遍 → 否则产出近乎重复的第二条压缩。已注入仍超限是「需进一步
+                # 压缩」的正当场景,不在此列(其 msg_hashes 对应原始消息,covers 会误判,故用 not injected 守住)。
+                redundant = (not injected) and store.covers(msg_hashes)
+                if redundant and not already_compressing:
+                    log.info(
+                        f"[MSG] API reported {total_input:,} tokens (> trigger {eff_trigger:,}), "
+                        f"but a matching compression already exists — skipping redundant compression "
+                        f"(in-flight full request returned after its compression landed)"
+                    )
+                if not already_compressing and not redundant:
                     win = _request_window(req_headers)
                     capped = " capped" if eff_trigger < TRIGGER_TOKENS else ""
                     log.info(
@@ -1383,7 +1443,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     entry["pre_tokens"] = total_input  # 压缩前规模,注入生效时展示收缩效果
                     # 本次压缩建立在已注入的条目之上;转正后那条即死条目,回收掉。常态是 match;
                     # 若这发走了 emergency 同步兜底(match 必为 None),则父是 emergency 登记的条目。
-                    entry["parent"] = match if match is not None else emergency_entry
+                    entry["parent"] = match if match is not None else (emergency_entry or proactive_entry)
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),

@@ -1,5 +1,75 @@
 # ChangeLog
 
+## 1.16.0 — 转发前主动同步压缩消除 resume 冷启动卡顿;修 PowerShell UTF-8 读取腐化 settings.json
+
+### 背景
+两件事合并发版。
+
+**(1) resume 第一发「假死」。** 实测发现 resume 一个大会话时,第一发请求会长时间无响应,用户以为死了 Ctrl+C
+再 resume 才恢复。排查确认**非死锁,而是冷启动 + 慢上游的假死**:resume 新会话的第一发请求此刻没有可命中
+的压缩(压缩要「看到第一发之后」才在后台算),于是把全量 ~257k token 的 transcript 打给第三方上游,缓存全冷,
+streaming 嚼完要数十秒(接近 1M 的会话可达数分钟);用户 Ctrl+C 后,后台压缩其实已算完入库,再 resume 就命中
+注入、请求缩到 ~44k、缓存转热,恢复正常。根因:第一发付了「全量打慢上游」的代价。
+
+**(2) 我在 1.15.x 引入的 PowerShell 编码回归。** hook 的 `Get-Content` 没带 `-Encoding UTF8`,在中文 Windows 按
+默认 cp936 读 UTF-8 的 `settings.json`,把「中文」误读成乱码,再 `ConvertTo-Json` + `WriteAllText` 写回 →
+**每个会话腐化一代**,最终某代字节落入 PUA 区(U+E15F)→ `ConvertFrom-Json` 彻底崩、hook 再也改不动
+settings.json,fail-open 失效。
+
+### 变更
+**主动同步压缩(`proxy/server.py`)**
+- 新增开关 `PROACTIVE_COMPRESS`(config `proactive_compress` / env `ROLLING_CONTEXT_PROACTIVE_COMPRESS`,默认开)。
+- 转发上游**之前**:未命中缓存(`not injected`)的请求,按 `len(raw_body)//4` 粗估 token(含 system+tools,
+  与 breakdown 日志同口径),超 `_effective_trigger` 即当场 `_emergency_compress` 同步压一次、把结果换进请求体
+  再发。复用既有同步压缩机制——压完即登记进 store(prefix + key 链)并落盘,**后续请求直接命中、不再付这次
+  同步延迟**。第一发账单也从全量(~257k)降到压后(~40k)。
+- defense-in-depth:主动压缩按粗估定的 keep 比例可能偏松、压后仍超限,故放宽 emergency 兜底条件为
+  `not injected or prewarm`——prewarm 的请求若仍吃 400,用 400 体里上游自报的真实 token 数再压一发,保住
+  「CC 永不见 400」。命中真实压缩条目(match)的 injected 请求不放行,它已是 known-good 尺寸。
+- 统计 record 新增 `prewarm` 字段;后台压缩父条目回收链补 `proactive_entry`。
+- 为何不做「SessionStart 从 transcript 预热」:压缩匹配是消息内容的**精确哈希链命中**,从 transcript JSONL 重建
+  CC 第一发的逐条消息极易漂移(CC 重排/插 system-reminder/改写 tool_result)→ 预热大概率不命中、白付一发
+  Haiku。转发前主动压缩压的就是请求里这批消息、注入同一发,确定性命中,故选它。
+
+**PowerShell UTF-8 修复(`hooks/start-proxy.ps1`)**
+- 三处 `Get-Content | ConvertFrom-Json`(读 rolling-context.json 配置、读 plugin.json 版本、读 settings.json 更新)
+  全部补 `-Encoding UTF8`。PS5.1 默认按进程 codepage(中文系统 = cp936)读文件内容,即便加 `-Raw` 也不够,
+  必须显式 `-Encoding UTF8`,否则 UTF-8 多字节字符被误读、反复读写腐化成乱码/PUA 字符。
+- 注:已被活跃旧客户端腐化的 settings.json 需新版本铺到所有客户端缓存 + 全部重启后才彻底止血(旧 hook 仍在
+  每个 SessionStart 重新腐化)。
+
+**无 Python 优雅降级(`hooks/start-proxy.ps1` `hooks/start-proxy.sh` `README.md`)**
+- proxy 本体是纯 Python 脚本,没解释器就起不来。旧行为:无 Python 时 hook 仍一路尝试启动 + 轮询,**每次
+  SessionStart 白等 ~5 秒**、刷警告;且若曾指向代理、后又没了 Python,重置 settings 的逻辑本身要 Python →
+  CC 可能被钉死在死代理上。
+- 两个 launcher 开头加「可用 Python」探测——**实跑 `python -c "print('ok')"` 核对输出**,绕开 Windows 微软
+  商店那个"命令在、却跑不出东西"的空壳 python3。探不到则:`.ps1` 跳过启动循环、落到既有 section 4 的**纯
+  PowerShell fail-open**(把 `ANTHROPIC_BASE_URL` 还原回真上游/官方 API,不依赖 Python)再 exit 0,让
+  `powershell ... || bash ...` 短路不落到 `.sh` 重复空等;`.sh`(Mac/Linux 及兜底)log 一行后直接 exit 0,
+  跳过 10×0.5s 空等。
+- README 加「Prerequisite: Python 3.7+ on PATH」章节:Windows 指 python.org + 勾 Add to PATH、警告别用商店
+  空壳、给 `python -c "print('ok')"` 自检;并写明无 Python 也不会坏(自禁 + fail-open,CC 照常用真上游)。
+
+**重复压缩去重(`proxy/server.py`)**
+- 现象:同一会话两发连续请求,第一发(慢全量)在途未返回时压缩还在后台跑、没注入 → 原样打上游;~50s 后
+  回来,本发自报 token 仍是旧全量值、又超 trigger,而此刻覆盖它的压缩往往已落库 → 响应末尾又触发一条**几乎
+  一样的第二次压缩**(白烧一发 Haiku)。
+- 修复:`CompressionStore` 新增只读 `covers(msg_hashes)`,同时检查已转正(`original_hashes`)和刚就绪待转正
+  (`pending_hashes`)的哈希链是否已覆盖当前消息。响应末尾后台触发块加守卫:`not injected and store.covers(...)`
+  即判为冗余、跳过。仅限「未注入」请求——已注入仍超限是「需进一步压缩」的正当场景,不在此列。
+
+**Dashboard 折叠/展开卡顿 + 压缩列语义(`proxy/dashboard.html`)**
+- 「最近请求」表从默认 `table-layout:auto` 改 `table-fixed` + `<colgroup>` 定死列宽。auto 下列宽依赖**所有行**内容,
+  展开/折叠任一错误明细行、或 15s 自动刷新整表重建,都会触发**全表 reflow**(列宽重算)→ 100 行就卡;fixed 后
+  列宽与内容解耦,切换行只局部重绘。
+- `renderRecent` 加签名守卫:数据(行数 + 各行 ts/status/压缩/output)没变就跳过整表重建,空闲时 15s 自动刷新不再
+  无谓重绘、也不打断正在查看的展开明细。
+- 「压缩」列从 `injected`(每个注入请求都打 ✓,满屏 ✓)改为 `first_compressed`(只标压缩**生效的第一个请求**),与
+  绿色「✂ 生效」徽标同义、不再刷屏。会话列加 `truncate` 防固定宽下溢出。
+
+**顺手清理**
+- 删除 `_request_window` / `_effective_trigger` 的重复定义(1.15.0 遗留的复制粘贴,后定义覆盖前定义,无害但冗余)。
+
 ## 1.15.1 — 摘要走 Haiku 时剥掉它不支持的 context-1m beta,修 summarizer 400
 
 ### 背景

@@ -66,7 +66,24 @@
       </div>
     </div>
     <div class="overflow-x-auto">
-      <table class="w-full text-xs">
+      <!-- table-fixed:列宽由 colgroup 定死、不再依赖每行内容 —— 否则 100 行 auto-layout 下,展开/折叠
+           任一行或 15s 整表重建都会触发全表 reflow(列宽重算),正是「折叠/展开很卡」的根因。 -->
+      <table class="w-full text-xs table-fixed">
+        <colgroup>
+          <col style="width:104px">      <!-- 时间 -->
+          <col>                          <!-- 模型:不设宽,吸收剩余空间(含压缩徽标) -->
+          <col style="width:80px">       <!-- 会话 -->
+          <col style="width:60px">       <!-- 输入 -->
+          <col style="width:72px">       <!-- 缓存读 -->
+          <col style="width:60px">       <!-- 输出 -->
+          <col style="width:60px">       <!-- tok/s -->
+          <col style="width:64px">       <!-- 首字 -->
+          <col style="width:64px">       <!-- 生成 -->
+          <col style="width:72px">       <!-- 总耗时 -->
+          <col style="width:48px">       <!-- 并发 -->
+          <col style="width:52px">       <!-- 压缩 -->
+          <col style="width:84px">       <!-- 状态 -->
+        </colgroup>
         <thead class="text-slate-500 border-b border-slate-800">
           <tr class="text-left">
             <th class="py-2 pr-3 font-medium">时间</th>
@@ -113,6 +130,7 @@ const charts = {};
 let state = { hours: '24' };
 let _bySession = [];           // 会话图 tooltip 用的实时引用(原地更新时闭包不会过期)
 const expandedRows = new Set(); // 已展开的错误明细行(按 ts),刷新后保持展开
+let _recentSig = null;          // 上次渲染的最近请求表签名:数据没变就跳过整表重建,免 15s 自动刷新空转重绘
 
 // ---- 格式化 ----
 function fmt(n){
@@ -365,6 +383,12 @@ function apiErr(snippet){
 // ---- 最近请求表 ----
 function renderRecent(rows){
   const tb = document.getElementById('recentBody');
+  // 签名守卫:仅当影响显示的字段变了才重建。空闲时(无新请求)15s 自动刷新拿到同一批数据 → 直接跳过,
+  // 不再无谓重绘整表、也不会打断正在展开查看的错误明细。展开状态由 toggleRow 直接改 DOM,无需进签名。
+  const sig = rows.length + '|' +
+    rows.map(r=>`${r.ts}:${r.status}:${r.first_compressed?1:0}:${r.output}`).join(',');
+  if (sig === _recentSig) return;
+  _recentSig = sig;
   if (!rows.length){ tb.innerHTML = '<tr><td colspan="13" class="py-4 text-center text-slate-600">暂无数据</td></tr>'; return; }
   tb.innerHTML = rows.map(r=>{
     const isErr = r.status>=400;
@@ -412,7 +436,7 @@ function renderRecent(rows){
     let row = `<tr class="border-b border-slate-900 hover:bg-slate-900/50${clickable}"${onclick}>
       <td class="py-1.5 pr-3 text-slate-400 whitespace-nowrap font-mono">${fmtClock(r.ts)}</td>
       <td class="py-1.5 pr-3 text-slate-300 whitespace-nowrap">${esc(r.model)}${badges}</td>
-      <td class="py-1.5 pr-3 text-slate-500 font-mono">${esc(r.session)}</td>
+      <td class="py-1.5 pr-3 text-slate-500 font-mono truncate" title="${esc(r.session)}">${esc(r.session)}</td>
       <td class="py-1.5 pr-3 text-right">${fmt(r.input)}</td>
       <td class="py-1.5 pr-3 text-right text-slate-400">${fmt(r.cache_read)}</td>
       <td class="py-1.5 pr-3 text-right">${fmt(r.output)}</td>
@@ -421,7 +445,7 @@ function renderRecent(rows){
       <td class="py-1.5 pr-3 text-right text-slate-400">${fmtMs(r.gen_ms)}</td>
       <td class="py-1.5 pr-3 text-right">${fmtMs(r.total_ms)}</td>
       <td class="py-1.5 pr-3 text-center">${conc}</td>
-      <td class="py-1.5 pr-3 text-center">${r.injected?'<span class="text-sky-400">✓</span>':'<span class="text-slate-700">·</span>'}</td>
+      <td class="py-1.5 pr-3 text-center">${r.first_compressed?'<span class="text-sky-400" title="压缩生效的第一个请求(首次用上压缩后数据)">✓</span>':'<span class="text-slate-700">·</span>'}</td>
       <td class="py-1.5 pr-3 text-right font-mono ${stColor} whitespace-nowrap"${stTitle}>${r.status||'—'}${srcBadge}</td>
     </tr>`;
     // 错误行:追加一行可展开的「响应明细」(默认隐藏,点击错误行切换)。

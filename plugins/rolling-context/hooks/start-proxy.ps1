@@ -28,15 +28,26 @@ $SettingsFile = Join-Path $ClaudeDir "settings.json"
 # 第三方 baseURL 配置（显式、稳定；存在时为权威，不再从 ANTHROPIC_BASE_URL 推导，杜绝来回横跳）。
 $ConfigFile = Join-Path $ClaudeDir "rolling-context.json"
 $Cfg = $null
-if (Test-Path $ConfigFile) { try { $Cfg = Get-Content $ConfigFile -Raw | ConvertFrom-Json } catch { $Cfg = $null } }
+if (Test-Path $ConfigFile) { try { $Cfg = Get-Content $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $Cfg = $null } }
 $Port = if ($Cfg -and $Cfg.port) { "$($Cfg.port)" } elseif ($env:ROLLING_CONTEXT_PORT) { $env:ROLLING_CONTEXT_PORT } else { "5588" }
 $ProxyUrl = "http://127.0.0.1:$Port"
 $HasConfigUpstream = ($null -ne $Cfg) -and ($null -ne $Cfg.upstream) -and ($Cfg.upstream -ne "")
-$CurrentVersion = if (Test-Path $SrcPluginJson) { (Get-Content $SrcPluginJson -Raw | ConvertFrom-Json).version } else { "unknown" }
+$CurrentVersion = if (Test-Path $SrcPluginJson) { (Get-Content $SrcPluginJson -Raw -Encoding UTF8 | ConvertFrom-Json).version } else { "unknown" }
 
 function Log($msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Add-Content -Path $HookLog -Value "[$ts] $msg"
+}
+
+# 探一个「真能用」的 Python:Windows 微软商店那个空壳 python/python3 会让命令"存在"却跑不出东西
+# (甚至弹商店),故实跑一句、核对输出,而非只看 Get-Command。
+function Test-Python {
+    try {
+        $out = & python -c "print('ok')" 2>$null
+        return ("$out".Trim() -eq "ok")
+    } catch {
+        return $false
+    }
 }
 
 # 判活以「活着的 /health」为唯一权威(自报 version + pid),pidfile 仅兜底。
@@ -65,6 +76,14 @@ function Stop-PortHolder($holderPid) {
 
 Log "Hook started. ProxyDir=$ProxyDir v$CurrentVersion$(if ($DevRoot) { ' [DEV]' })"
 
+# 无可用 Python:proxy 是纯 Python 脚本,没解释器起不来。跳过启动尝试(免轮询空等),直接落到下面
+# section 4 的 fail-open——它用纯 PowerShell 把 ANTHROPIC_BASE_URL 还原回真上游/官方 API(不依赖 Python)。
+# 末尾照常 exit 0,让 hook 的 `powershell ... || bash ...` 短路、不再落到 .sh 重复空等 5 秒。
+$HasPython = Test-Python
+if (-not $HasPython) {
+    Log "Python not found on PATH - rolling-context disabled (proxy needs Python). Failing open."
+}
+
 # 2) 判活 + 升级闸门:
 #    • 在跑版本「可识别且 >= 本会话版本」→ 复用(绝不降级互踢)
 #    • 在跑版本更低,或无法识别(如旧代理 /health 不报 version)→ 重启,让新版/新代码顶上
@@ -88,7 +107,8 @@ if ($health) {
 }
 
 # 3) 不健康(或刚为升级停掉)→ 启动一个新代理,轮询等它就绪。
-if (-not $proxyHealthy) {
+#    无 Python 时整段跳过:起不来,空等也是白等;交给 section 4 fail-open。
+if (-not $proxyHealthy -and $HasPython) {
     # 兜底:pidfile 记的进程还活着但 /health 不通(卡死)→ 杀掉再起。
     if (Test-Path $PidFile) {
         $savedPid = (Get-Content $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
@@ -135,7 +155,9 @@ if (-not $proxyHealthy) {
 # 4) 写 settings.json:健康才指向代理;否则 fail-open 放行到真上游(绝不连累 CC)。
 try {
     if (Test-Path $SettingsFile) {
-        $settings = Get-Content $SettingsFile -Raw | ConvertFrom-Json
+        # 必须按 UTF-8 读:中文 Windows 默认 codepage(936)会把 settings.json 里的 UTF-8 多字节
+        # (如 "language": "中文")误读,ConvertTo-Json 再写回就逐会话腐化,直到生成非法字节崩掉解析。
+        $settings = Get-Content $SettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
     } else {
         $settings = [PSCustomObject]@{}
     }

@@ -28,6 +28,21 @@ Claude Code  ──►  Rolling Context Proxy (:5588)  ──►  Upstream API
 
 ## Install
 
+### Prerequisite: Python 3.7+ on your PATH
+
+The proxy **is** a Python script (pure stdlib — no `pip install`, no venv), launched by the SessionStart hook. You just need a Python interpreter reachable on your `PATH`:
+
+- **macOS / Linux** — almost always already present (`python3`). Nothing to do.
+- **Windows** — install from [python.org](https://www.python.org/downloads/) and tick *"Add python.exe to PATH"*. **Avoid the Microsoft Store `python3` stub**: it registers a hollow shim that *looks* installed (`where python` finds it) but runs nothing (or pops the Store), which the hook treats as "no Python". Verify with:
+
+  ```
+  python -c "print('ok')"
+  ```
+
+  If that prints `ok`, you're set.
+
+**No Python? Nothing breaks.** The plugin detects the missing interpreter, disables itself, and fails open — Claude Code keeps working against your real upstream, just without rolling-context compression (see `~/.claude/rolling-context-hook.log` for a one-line note). Install Python and restart the terminal to enable compression.
+
 ```
 /plugin marketplace add konijiwa110/market
 /plugin install rolling-context@konijiwa-plugin
@@ -40,7 +55,7 @@ claude plugin marketplace add konijiwa110/market
 claude plugin install rolling-context@konijiwa-plugin
 ```
 
-On the **first start**, the SessionStart hook configures `ANTHROPIC_BASE_URL` and starts the proxy. Since the env var only takes effect on the next terminal, **restart your terminal once** — after that everything works automatically. Requires Python 3.7+ (no pip install needed — pure stdlib).
+On the **first start**, the SessionStart hook configures `ANTHROPIC_BASE_URL` and starts the proxy. Since the env var only takes effect on the next terminal, **restart your terminal once** — after that everything works automatically.
 
 ### Troubleshooting: `marketplace add` fails with "Host key verification failed"
 
@@ -80,9 +95,13 @@ Drop a `~/.claude/rolling-context.json` to override defaults. Every key is **con
 | Target tokens kept | `target` | `ROLLING_CONTEXT_TARGET` (default `40000`) |
 | Summarizer model | `model` | `ROLLING_CONTEXT_MODEL` (default `claude-haiku-4-5-20251001`) |
 | Context window override | `context_window` | `ROLLING_CONTEXT_CONTEXT_WINDOW` (default `0` = auto-detect from the `anthropic-beta` header) |
+| Proactive compression | `proactive_compress` | `ROLLING_CONTEXT_PROACTIVE_COMPRESS` (default `1` = on) |
+| Emergency compression | `emergency_compress` | `ROLLING_CONTEXT_EMERGENCY_COMPRESS` (default `1` = on) |
 | Listen port | `port` | `ROLLING_CONTEXT_PORT` (default `5588`) |
 
 The proxy can't see your model's real context limit, only the request body — so the effective trigger is automatically capped at **90% of the detected window** so a `trigger` set above your real limit can't silently disable compression. The window is detected per request from the `anthropic-beta` header (`context-1m-*` → 1M, otherwise 200k, matching how Claude Code's `model[1m]` alias works). Set `context_window` only when a third-party endpoint advertises 1M via the header but actually caps lower — pin it (e.g. `200000`) to override the header detection.
+
+**Proactive vs. emergency compression** are two safety nets, both on by default. *Proactive* fires **before** forwarding: when a cache-miss request is estimated (from body size) to exceed the effective trigger, the proxy compresses it synchronously and forwards the shrunk body — this kills the cold-start stall on `resume`, where the first request would otherwise ship the entire transcript to a cold upstream cache (tens of seconds to minutes) before any background compression can land. *Emergency* fires **after** an upstream `400 prompt too long`: it compresses and retries once so Claude Code never sees the 400. Leave both on unless you're debugging the raw forwarding path.
 
 **The default config does not include `upstream` or `apikey`** — they follow your environment (`settings.json`'s `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`), so switching environments or accounts is picked up automatically on the next session. Only pin them in `rolling-context.json` when you want a fixed third-party endpoint that does not vary with the environment. Copy [`rolling-context.example.json`](./rolling-context.example.json) to get started — it holds only the environment-independent compression preferences:
 

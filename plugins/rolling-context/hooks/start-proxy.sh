@@ -58,6 +58,15 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HOOKLOG"
 }
 
+# 无可用 Python:proxy 是纯 Python 脚本,没解释器就起不来 → 早退 fail-open(CC 照常走真上游、只是没
+# 压缩),并跳过下面 10×0.5s 的健康空等。实跑一句核对输出,绕开 Windows 商店空壳 python3。注:Windows
+# 无 Python 时 ps1 已先 exit 0 让 `powershell ... || bash ...` 短路,通常落不到这里;本守卫主要兜
+# Mac/Linux 极少数无 python3 的机器(那种机器本就没把 ANTHROPIC_BASE_URL 指过代理,无需重置 settings)。
+if [ "$(_py -c 'print("ok")' 2>/dev/null)" != "ok" ]; then
+    log "Python not found on PATH - rolling-context disabled (proxy needs Python). Failing open to upstream."
+    exit 0
+fi
+
 # 判活以「活着的 /health」为唯一权威(自报 version + pid),pidfile 仅兜底。
 # 健康 → 打印 "<version>\t<pid>";不健康 → 空输出。
 proxy_health() {
