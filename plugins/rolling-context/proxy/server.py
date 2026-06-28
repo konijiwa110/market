@@ -169,6 +169,15 @@ def _load_upstream() -> str:
 UPSTREAM_URL = _load_upstream()
 TRIGGER_TOKENS = int(_cfg("trigger", "ROLLING_CONTEXT_TRIGGER", 160000))
 TARGET_TOKENS = int(_cfg("target", "ROLLING_CONTEXT_TARGET", 40000))
+# 真实上下文窗口判定:代理只看请求体,本不知模型窗口是 200k 还是 1M。CC 用 model[1m] 时会带
+# anthropic-beta: context-1m-... 头 → 据此每请求确定性判窗口。用户把 trigger 配超真实窗口(如为
+# 1M 调到 320k 但实际只 200k)时,主动压缩永不触发、撞墙吃 400;有效 trigger 夹到「窗口×安全余量」
+# 之下即可在撞墙前主动压。第三方上游可能谎报 1M(发了头实际 200k),用 context_window 显式钉死覆盖。
+WINDOW_1M = 1_000_000
+WINDOW_DEFAULT = 200_000
+TRIGGER_SAFETY = 0.9            # 有效 trigger 占真实窗口的比例(留 10% 给单轮突发增长 + emergency 兜底)
+_BETA_1M_MARK = "context-1m"   # 子串匹配,对日期后缀(context-1m-2025-08-07)变化稳健
+CONTEXT_WINDOW_OVERRIDE = int(_cfg("context_window", "ROLLING_CONTEXT_CONTEXT_WINDOW", 0))  # 0=未设,走头判定
 SUMMARIZER_MODEL = _cfg("model", "ROLLING_CONTEXT_MODEL", "claude-haiku-4-5-20251001")
 # 鉴权：config 显式给了才用，否则透传 claude 发来的 ANTHROPIC_AUTH_TOKEN（默认不写）。
 APIKEY = _cfg("apikey", "ROLLING_CONTEXT_APIKEY", "")
@@ -660,6 +669,42 @@ def get_passthrough_headers(req_headers: dict) -> dict:
         if lower not in ("host", "content-length", "transfer-encoding"):
             headers[key] = value
     return headers
+
+
+def _request_window(req_headers: dict) -> int:
+    """判出本请求的真实上下文窗口上限(token)。config 的 context_window 显式覆盖优先(供第三方上游
+    谎报 1M 时钉死);否则读 anthropic-beta 头:含 context-1m → 1M,否则 200k。req_headers 是原始
+    大小写 dict,故 .lower() 做大小写无关匹配。"""
+    if CONTEXT_WINDOW_OVERRIDE > 0:
+        return CONTEXT_WINDOW_OVERRIDE
+    for k, v in req_headers.items():
+        if k.lower() == "anthropic-beta" and _BETA_1M_MARK in (v or "").lower():
+            return WINDOW_1M
+    return WINDOW_DEFAULT
+
+
+def _effective_trigger(req_headers: dict) -> int:
+    """主动压缩的有效阈值:不超过真实窗口×安全余量,避免 trigger 配超导致永不触发、撞墙吃 400。
+    正常配置(trigger 已低于该值)不受影响,只在配超时才夹紧。"""
+    return min(TRIGGER_TOKENS, int(_request_window(req_headers) * TRIGGER_SAFETY))
+
+
+def _request_window(req_headers: dict) -> int:
+    """判出本请求的真实上下文窗口上限(token)。config 的 context_window 显式覆盖优先(供第三方上游
+    谎报 1M 时钉死);否则读 anthropic-beta 头:含 context-1m → 1M,否则 200k。req_headers 是原始
+    大小写 dict,故 .lower() 做大小写无关匹配。"""
+    if CONTEXT_WINDOW_OVERRIDE > 0:
+        return CONTEXT_WINDOW_OVERRIDE
+    for k, v in req_headers.items():
+        if k.lower() == "anthropic-beta" and _BETA_1M_MARK in (v or "").lower():
+            return WINDOW_1M
+    return WINDOW_DEFAULT
+
+
+def _effective_trigger(req_headers: dict) -> int:
+    """主动压缩的有效阈值:不超过真实窗口×安全余量,避免 trigger 配超导致永不触发、撞墙吃 400。
+    正常配置(trigger 已低于该值)不受影响,只在配超时才夹紧。"""
+    return min(TRIGGER_TOKENS, int(_request_window(req_headers) * TRIGGER_SAFETY))
 
 
 def _validate_tool_pairs(messages: list) -> list:
@@ -1317,15 +1362,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     f"{msg_chars:,} chars -> ~{total_input:,} tokens"
                 )
 
-            # Trigger compression based on token count
-            if total_input > 0 and total_input > TRIGGER_TOKENS:
+            # Trigger compression based on token count.
+            # 有效 trigger 夹到真实窗口×安全余量之下:trigger 配超真实窗口时(如为 1M 调高但实际 200k),
+            # 仍能在撞墙前主动压,而非永不触发、退化到 400 emergency 兜底。
+            eff_trigger = _effective_trigger(req_headers)
+            if total_input > 0 and total_input > eff_trigger:
                 already_compressing = any(
                     e["thread"] is not None and e["thread"].is_alive()
                     for e in store.compressions
                 )
                 if not already_compressing:
+                    win = _request_window(req_headers)
+                    capped = " capped" if eff_trigger < TRIGGER_TOKENS else ""
                     log.info(
-                        f"[MSG] API reported {total_input:,} tokens (trigger: {TRIGGER_TOKENS:,}). "
+                        f"[MSG] API reported {total_input:,} tokens "
+                        f"(trigger: {eff_trigger:,}{capped}, window {win:,}). "
                         f"Compressing in background..."
                     )
                     entry = store.add()
@@ -1393,6 +1444,11 @@ class ThreadedHTTPServer(HTTPServer):
 def main():
     log.info(f"Starting Rolling Context Proxy v{VERSION} on port {LISTEN_PORT}")
     log.info(f"  Trigger at: {TRIGGER_TOKENS:,} tokens")
+    if CONTEXT_WINDOW_OVERRIDE > 0:
+        log.info(f"  Context window: {CONTEXT_WINDOW_OVERRIDE:,} tokens (pinned via config; overrides header detection)")
+    else:
+        log.info(f"  Context window: auto-detect per request (anthropic-beta context-1m → 1M, else 200k)")
+    log.info(f"  Effective trigger capped at {int(TRIGGER_SAFETY*100)}% of detected window")
     log.info(f"  Compress down to: {TARGET_TOKENS:,} tokens (recent context)")
     log.info(f"  Summarizer model: {SUMMARIZER_MODEL}")
     log.info(f"  Forwarding to: {UPSTREAM_URL}")

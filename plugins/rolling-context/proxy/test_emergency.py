@@ -496,5 +496,73 @@ class StatsPathIsolation(unittest.TestCase):
         )
 
 
+class RequestWindow(unittest.TestCase):
+    """_request_window 判出本请求真实窗口:anthropic-beta 含 context-1m → 1M,否则 200k;
+    config 的 context_window 显式覆盖优先(供第三方上游谎报 1M 时钉死)。"""
+
+    def setUp(self):
+        self._orig = server.CONTEXT_WINDOW_OVERRIDE
+        server.CONTEXT_WINDOW_OVERRIDE = 0  # 默认走头判定
+
+    def tearDown(self):
+        server.CONTEXT_WINDOW_OVERRIDE = self._orig
+
+    def test_beta_header_context_1m_is_1m(self):
+        h = {"anthropic-beta": "context-1m-2025-08-07"}
+        self.assertEqual(server._request_window(h), server.WINDOW_1M)
+
+    def test_beta_among_other_betas(self):
+        h = {"anthropic-beta": "fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07"}
+        self.assertEqual(server._request_window(h), server.WINDOW_1M)
+
+    def test_no_beta_header_is_200k(self):
+        self.assertEqual(server._request_window({"content-type": "application/json"}), server.WINDOW_DEFAULT)
+
+    def test_beta_header_without_1m_is_200k(self):
+        h = {"anthropic-beta": "fine-grained-tool-streaming-2025-05-14"}
+        self.assertEqual(server._request_window(h), server.WINDOW_DEFAULT)
+
+    def test_header_name_is_case_insensitive(self):
+        h = {"Anthropic-Beta": "Context-1M-2025-08-07"}
+        self.assertEqual(server._request_window(h), server.WINDOW_1M)
+
+    def test_config_override_pins_window_over_header(self):
+        server.CONTEXT_WINDOW_OVERRIDE = 200_000
+        h = {"anthropic-beta": "context-1m-2025-08-07"}  # 上游谎报 1M
+        self.assertEqual(server._request_window(h), 200_000, "config 钉死必须压过头判定")
+
+
+class EffectiveTrigger(unittest.TestCase):
+    """_effective_trigger = min(配置 trigger, 真实窗口×0.9):配超时夹紧、正常配置不受影响。"""
+
+    def setUp(self):
+        self._orig_trig = server.TRIGGER_TOKENS
+        self._orig_ovr = server.CONTEXT_WINDOW_OVERRIDE
+        server.CONTEXT_WINDOW_OVERRIDE = 0
+
+    def tearDown(self):
+        server.TRIGGER_TOKENS = self._orig_trig
+        server.CONTEXT_WINDOW_OVERRIDE = self._orig_ovr
+
+    def test_normal_trigger_under_200k_window_not_capped(self):
+        server.TRIGGER_TOKENS = 160_000
+        self.assertEqual(server._effective_trigger({}), 160_000)  # 200k 窗口,180k 夹线,160k<180k 不夹
+
+    def test_high_trigger_capped_to_90pct_of_200k(self):
+        server.TRIGGER_TOKENS = 320_000  # 为 1M 配高,但请求无 1m 头 → 实际 200k
+        self.assertEqual(server._effective_trigger({}), 180_000)
+
+    def test_high_trigger_under_1m_window_not_capped(self):
+        server.TRIGGER_TOKENS = 320_000
+        h = {"anthropic-beta": "context-1m-2025-08-07"}  # 真 1M,900k 夹线,320k<900k 不夹
+        self.assertEqual(server._effective_trigger(h), 320_000)
+
+    def test_override_pins_window_for_trigger(self):
+        server.TRIGGER_TOKENS = 320_000
+        server.CONTEXT_WINDOW_OVERRIDE = 200_000
+        h = {"anthropic-beta": "context-1m-2025-08-07"}  # 头说 1M 但被 config 钉死 200k
+        self.assertEqual(server._effective_trigger(h), 180_000)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

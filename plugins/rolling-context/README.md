@@ -79,7 +79,10 @@ Drop a `~/.claude/rolling-context.json` to override defaults. Every key is **con
 | Trigger tokens | `trigger` | `ROLLING_CONTEXT_TRIGGER` (default `160000`) |
 | Target tokens kept | `target` | `ROLLING_CONTEXT_TARGET` (default `40000`) |
 | Summarizer model | `model` | `ROLLING_CONTEXT_MODEL` (default `claude-haiku-4-5-20251001`) |
+| Context window override | `context_window` | `ROLLING_CONTEXT_CONTEXT_WINDOW` (default `0` = auto-detect from the `anthropic-beta` header) |
 | Listen port | `port` | `ROLLING_CONTEXT_PORT` (default `5588`) |
+
+The proxy can't see your model's real context limit, only the request body — so the effective trigger is automatically capped at **90% of the detected window** so a `trigger` set above your real limit can't silently disable compression. The window is detected per request from the `anthropic-beta` header (`context-1m-*` → 1M, otherwise 200k, matching how Claude Code's `model[1m]` alias works). Set `context_window` only when a third-party endpoint advertises 1M via the header but actually caps lower — pin it (e.g. `200000`) to override the header detection.
 
 **The default config does not include `upstream` or `apikey`** — they follow your environment (`settings.json`'s `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`), so switching environments or accounts is picked up automatically on the next session. Only pin them in `rolling-context.json` when you want a fixed third-party endpoint that does not vary with the environment. Copy [`rolling-context.example.json`](./rolling-context.example.json) to get started — it holds only the environment-independent compression preferences:
 

@@ -1,5 +1,33 @@
 # ChangeLog
 
+## 1.15.0 — 按请求头判定真实上下文窗口,有效 trigger 自动夹到窗口之下
+
+### 背景
+代理只看请求体,本不知当前模型的真实窗口是 200k 还是 1M。很多用户实际是 200k 却不自知(模型不支持
+1M,或第三方端点没透传 1M)。一旦把 `trigger` 配到 200k 以上(比如为 1M 调到 320k),主动压缩永远
+不触发,模型先撞 200k 墙、上游返回 400 —— 现有 `_emergency_compress` 能接住不崩,但这是退化路径:
+每次溢出都先白跑一发上游 400 + 付同步压缩延迟,且不自愈。
+
+关键信号:Claude Code 用 `model[1m]` 时会给请求带 `anthropic-beta: context-1m-2025-08-07` 头。代理拦在
+链路上能直接读到 → 确定性、每请求、零配置地判出真实窗口,在撞墙前就主动压。
+
+### 变更(`proxy/server.py`)
+- **请求头窗口判定**:新增 `_request_window(req_headers)` —— `anthropic-beta` 含 `context-1m` 子串判
+  1M,否则 200k(子串匹配,对日期后缀变化稳健;头名大小写无关)。
+- **有效 trigger 夹紧**:新增 `_effective_trigger(req_headers) = min(配置 trigger, 真实窗口 × 0.9)`。
+  主动触发判定(唯一 gating 点)由比 `TRIGGER_TOKENS` 改为比有效 trigger,并在日志标出判出的窗口与
+  是否夹紧。只在配置 trigger 超过窗口 90% 时才夹,正常配置(160k < 180k)不受影响。
+- **第三方谎报 1M 的钉死覆盖**:新增配置 `context_window` / 环境 `ROLLING_CONTEXT_CONTEXT_WINDOW`
+  (默认 0 = 走头判定),显式覆盖头判定。供「上游发了 1M 头实际只有 200k」的端点钉死真实窗口。
+- **启动日志**:打印判定模式(头自动判 / config 钉死的窗口值)与夹紧比例。
+- **不动**:`_emergency_compress` 与 400 prompt-too-long 同步兜底原样保留,作为头判定/配置都没拦住的
+  真实撞墙的最后一层。
+
+### 实测(2026-06-28)
+`proxy/test_emergency.py` 新增 `RequestWindow`(含/不含 context-1m、混在多 beta 中、无头、头名大小写、
+config 覆盖优先)与 `EffectiveTrigger`(正常不夹、配超夹到 200k×90%、1M 窗口不夹、override 钉死)共
+9 例。全套 `test_emergency` + `test_compressor` + `test_stats` 合计 **41 例全绿**。
+
 ## 1.14.0 — 第二轮审查(compressor / stats / hooks)四处加固:统计隔离、文件压实、空响应防护、脚本对齐
 
 ### 背景

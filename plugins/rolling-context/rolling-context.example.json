@@ -1,5 +1,5 @@
 {
-  "_comment": "复制到 ~/.claude/rolling-context.json。每项都是 config 优先、环境兜底：写了就用、没写就从环境读。默认不要写 upstream 和 apikey —— 它们跟随环境（settings.json 的 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN），切换环境/账号自动跟随；只有想钉死到某个第三方端点时才显式加 \"upstream\": \"https://...\" 和/或 \"apikey\": \"...\"。这里只放与环境无关的压缩偏好。",
+  "_comment": "复制到 ~/.claude/rolling-context.json。每项都是 config 优先、环境兜底：写了就用、没写就从环境读。默认不要写 upstream 和 apikey —— 它们跟随环境（settings.json 的 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN），切换环境/账号自动跟随；只有想钉死到某个第三方端点时才显式加 \"upstream\": \"https://...\" 和/或 \"apikey\": \"...\"。这里只放与环境无关的压缩偏好。真实上下文窗口默认从请求的 anthropic-beta 头自动判（含 context-1m 即 1M，否则 200k），有效 trigger 自动夹到窗口 90% 之下；只有当第三方上游谎报 1M（发了头实际只有 200k）时才需加 \"context_window\": 200000 钉死覆盖。",
   "trigger": 160000,
   "target": 40000,
   "model": "claude-haiku-4-5-20251001"
