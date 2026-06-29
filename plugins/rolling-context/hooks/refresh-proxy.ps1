@@ -11,7 +11,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ClaudeDir = Join-Path $env:USERPROFILE ".claude"
 $ConfigFile = Join-Path $ClaudeDir "rolling-context.json"
 $Cfg = $null
-if (Test-Path $ConfigFile) { try { $Cfg = Get-Content $ConfigFile -Raw | ConvertFrom-Json } catch { $Cfg = $null } }
+if (Test-Path $ConfigFile) { try { $Cfg = Get-Content $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $Cfg = $null } }
 $Port = if ($Cfg -and $Cfg.port) { [int]"$($Cfg.port)" } elseif ($env:ROLLING_CONTEXT_PORT) { [int]$env:ROLLING_CONTEXT_PORT } else { 5588 }
 
 function Get-Listeners($p) {
