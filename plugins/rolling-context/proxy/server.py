@@ -109,6 +109,9 @@ def _cfg(key: str, env_key: str, default):
 
 
 LISTEN_PORT = int(_cfg("port", "ROLLING_CONTEXT_PORT", 5588))
+# 监听地址:默认仅回环(127.0.0.1,安全)。设 ROLLING_CONTEXT_HOST=0.0.0.0 可让其它设备连接,
+# 但代理会带 ANTHROPIC_AUTH_TOKEN 转发——开放后务必限可信内网,勿暴露公网。
+LISTEN_HOST = str(_cfg("host", "ROLLING_CONTEXT_HOST", "127.0.0.1"))
 
 
 def _plugin_version() -> str:
@@ -1802,7 +1805,7 @@ class ThreadedHTTPServer(HTTPServer):
 
 
 def main():
-    log.info(f"Starting Rolling Context Proxy v{VERSION} on port {LISTEN_PORT}")
+    log.info(f"Starting Rolling Context Proxy v{VERSION} on {LISTEN_HOST}:{LISTEN_PORT}")
     log.info(f"  Trigger at: {TRIGGER_TOKENS:,} tokens")
     if CONTEXT_WINDOW_OVERRIDE > 0:
         log.info(f"  Context window: {CONTEXT_WINDOW_OVERRIDE:,} tokens (pinned via config; overrides header detection)")
@@ -1816,7 +1819,7 @@ def main():
 
     # 绑定即锁:端口被占 = 已有实例在跑,干净退出(exit 0),绝不抢占成双实例。
     try:
-        server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
+        server = ThreadedHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
     except OSError as e:
         log.warning(f"Port {LISTEN_PORT} already in use ({e}); another instance owns it — exiting cleanly.")
         sys.exit(0)

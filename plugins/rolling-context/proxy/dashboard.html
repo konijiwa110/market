@@ -243,6 +243,7 @@ img, video { max-width: 100%; height: auto; }
           <col style="width:80px">       <!-- 会话 -->
           <col style="width:60px">       <!-- 输入 -->
           <col style="width:72px">       <!-- 缓存读 -->
+          <col style="width:72px">       <!-- 缓存创建 -->
           <col style="width:60px">       <!-- 输出 -->
           <col style="width:140px">      <!-- 输出明细 -->
           <col style="width:60px">       <!-- tok/s -->
@@ -261,6 +262,7 @@ img, video { max-width: 100%; height: auto; }
             <th class="py-2 pr-3 font-medium">会话</th>
             <th class="py-2 pr-3 font-medium text-right">输入</th>
             <th class="py-2 pr-3 font-medium text-right">缓存读</th>
+            <th class="py-2 pr-3 font-medium text-right">缓存创建</th>
             <th class="py-2 pr-3 font-medium text-right">输出</th>
             <th class="py-2 pr-3 font-medium">明细</th>
             <th class="py-2 pr-3 font-medium text-right">tok/s</th>
@@ -580,7 +582,7 @@ function renderRecent(rows){
     rows.map(r=>`${r.ts}:${r.status}:${r.first_compressed?1:0}:${r.output}:${r.archive_file?1:0}`).join(',');
   if (sig === _recentSig) return;
   _recentSig = sig;
-  if (!rows.length){ tb.innerHTML = '<tr><td colspan="15" class="py-4 text-center text-slate-600">暂无数据</td></tr>'; return; }
+  if (!rows.length){ tb.innerHTML = '<tr><td colspan="16" class="py-4 text-center text-slate-600">暂无数据</td></tr>'; return; }
   tb.innerHTML = rows.map(r=>{
     const isErr = r.status>=400;
     const stColor = isErr ? 'text-rose-400' : (r.status===200 ? 'text-emerald-400' : 'text-slate-400');
@@ -630,6 +632,7 @@ function renderRecent(rows){
       <td class="py-1.5 pr-3 text-slate-500 font-mono truncate" title="${esc(r.session)}">${esc(r.session)}</td>
       <td class="py-1.5 pr-3 text-right">${fmt(r.input)}</td>
       <td class="py-1.5 pr-3 text-right text-slate-400">${fmt(r.cache_read)}</td>
+      <td class="py-1.5 pr-3 text-right text-slate-400">${fmt(r.cache_create)}</td>
       <td class="py-1.5 pr-3 text-right">${fmt(r.output)}</td>
       <td class="py-1.5 pr-3 text-[11px]">${breakdownCell(r)}</td>
       <td class="py-1.5 pr-3 text-right">${tpsCell}</td>
@@ -661,7 +664,7 @@ function renderRecent(rows){
         ? `<div class="text-[11px] text-amber-300/90 mb-1">💡 ${esc(apiInfo.hint)}</div>` : '';
       const open = expandedRows.has(key);  // 刷新后保持上次的展开状态
       row += `<tr class="${open?'':'hidden '}bg-slate-900/70">
-        <td colspan="15" class="py-2 px-3 border-b border-slate-800">
+        <td colspan="16" class="py-2 px-3 border-b border-slate-800">
           ${msgHtml}
           <div class="text-[11px] text-slate-400 font-mono mb-1">${meta}</div>
           ${hintHtml}${apiHintHtml}
