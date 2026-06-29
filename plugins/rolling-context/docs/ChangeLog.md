@@ -17,6 +17,20 @@
 - **already_compressing 加 pending/intent 检查**:覆盖 thread alive → pending 待转正 → intent 已声明的全生命周期。
 - **_prune_locked busy() 扩展**:有 intent_hashes 或 pending 的条目也视为在途,不误剪。
 
+### 后续根治(同版本):去重收敛为单一原子判定
+上面保留了两道防线——`covers`(精确、内容感知)与全局 `already_compressing`(粗粒度)。审查发现后者两个毛病:
+① **跨会话误挡**——某会话后台压缩在跑的整个 30~50s 内,其它会话只要触发判断就看到 `already_compressing=True`
+而跳过自己的压缩;② **TOCTOU**——「检查 covers → store.add 登记意图」非原子,两个并发请求可能都通过 covers 后各起
+一个线程重复压同一段(全局 already_compressing 也兜不住:第一个请求的线程尚未 start 时第二个就已通过检查)。
+- **promote_pending 字段转正收进 `self._lock`**:与 `covers`/`find_match` 同锁互斥,去重判定永远读到一致快照,
+  消除「`pending` 已清而 `original_hashes` 尚未就绪」的半态竞争;含 IO 的 `remove`/`persist`/`log` 移到锁外
+  (`_lock` 不可重入,且避免持锁做盘/日志 IO 阻塞并发热路径)。
+- **新增 `claim_compression(msg_hashes, exclude)`**:一把锁内原子完成「covers 检查 → 建条目 → 写 intent_hashes」,
+  返回条目或 None。触发块改用它,**删除全局 `already_compressing`**;`covers` 拆出无锁实现 `_covers_locked` 供复用。
+- **效果**:`covers` 成为唯一、精确、无竞争的去重判定——跨会话误挡消失,并发重复触发的 TOCTOU 窗口关闭。
+- **测试**:新增 `ClaimCompression` 6 例(空库登记意图 / promoted·pending·在途 intent 三态拦截 / exclude 放行 /
+  更新条目挡下);全套 80 测试通过。
+
 ## 1.17.0 — 输出明细拆分(thinking/text/tool_use)+ 大输出/长耗时回合整份归档备查
 
 ### 背景

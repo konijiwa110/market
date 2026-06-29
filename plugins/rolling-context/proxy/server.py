@@ -504,20 +504,25 @@ class CompressionStore:
         检查顺序:original_hashes(已转正) → pending_hashes(待转正) → intent_hashes(刚声明意图),
         三者覆盖从触发到转正的全生命周期。"""
         with self._lock:
-            for entry in self._compressions:
-                if entry is exclude:
-                    continue
-                oh = entry["original_hashes"] or entry.get("pending_hashes") or entry.get("intent_hashes")
-                if not oh:
-                    continue
-                chain_len = len(oh)
-                for start in range(len(msg_hashes) - chain_len + 1):
-                    if msg_hashes[start:start + chain_len] == oh:
-                        return True
+            return self._covers_locked(msg_hashes, exclude)
+
+    def _covers_locked(self, msg_hashes: list, exclude=None) -> bool:
+        """covers 的无锁实现(调用者须已持 self._lock)。供 covers 与 claim_compression 复用,
+        使「检查去重 → 登记意图」能在同一临界区内原子完成。"""
+        for entry in self._compressions:
+            if entry is exclude:
+                continue
+            oh = entry["original_hashes"] or entry.get("pending_hashes") or entry.get("intent_hashes")
+            if not oh:
+                continue
+            chain_len = len(oh)
+            for start in range(len(msg_hashes) - chain_len + 1):
+                if msg_hashes[start:start + chain_len] == oh:
+                    return True
         return False
 
-    def add(self) -> dict:
-        entry = {
+    def _new_entry(self) -> dict:
+        return {
             "original_hashes": [],   # hashes of original messages we replaced
             "prefix": None,          # compressed replacement messages
             "pending": None,         # pending compression result
@@ -528,10 +533,27 @@ class CompressionStore:
             "pre_tokens": 0,         # 触发本次压缩时的上下文 token 数(压缩前规模,用于展示收缩效果)
             "parent": None,          # 本压缩建立其上的父条目(同会话上一次压缩);转正时回收,避免死条目堆积
         }
+
+    def add(self) -> dict:
+        entry = self._new_entry()
         with self._lock:
             self._compressions.append(entry)
             self._prune_locked()
         return entry
+
+    def claim_compression(self, msg_hashes: list, exclude=None):
+        """原子地「检查去重 + 登记压缩意图」:在一把锁内先 covers(排除注入所用条目 exclude),没有
+        「更新」的压缩覆盖同一段才新建条目、登记 intent_hashes 并入库,返回该条目;已被覆盖则返回 None。
+        把「检查→登记」收进同一临界区,杜绝两个并发请求各自通过 covers 后重复触发同一段压缩——
+        此前靠全局 already_compressing 粗粒度兜,既不精确(TOCTOU 仍漏)又会跨会话误挡。"""
+        with self._lock:
+            if self._covers_locked(msg_hashes, exclude=exclude):
+                return None
+            entry = self._new_entry()
+            entry["intent_hashes"] = list(msg_hashes)
+            self._compressions.append(entry)
+            self._prune_locked()
+            return entry
 
     def _prune_locked(self):
         """内存表封顶(已持锁):落盘/加载只在两端裁剪,内存里的 _compressions 原本只增不减,
@@ -560,23 +582,35 @@ class CompressionStore:
         子压缩转正(prefix 就绪)后,它建立其上的父条目此后永不会再被选为 best → 回收掉,
         使每个会话在表里只剩 1 条活条目,避免死条目把全局名额(STORE_MAX_ENTRIES)堆满、
         把别的并发会话挤出去。先置 prefix 再删父,中间无空窗;父可能为 None(本会话首压)
-        或已被删,remove 容错。"""
+        或已被删,remove 容错。
+
+        字段转正(prefix/original_hashes/pending*)在锁内完成,与 covers/find_match 同锁互斥,
+        使去重判定永远读到一致快照(不会撞见 pending 已清而 original_hashes 尚未就绪的半态);
+        含 IO 的收尾(remove/persist/log)移到锁外——_lock 不可重入,remove/persist 自带锁,
+        放锁内会二次获取而死锁;日志放锁外则避免持锁做盘 IO 阻塞并发热路径。"""
         promoted = 0
-        for entry in list(self._compressions):  # 拷一份:回收会改 _compressions,避免迭代中改
-            if entry.get("pending") is None:
-                continue
-            entry["prefix"] = entry["pending"]
-            entry["original_hashes"] = entry["pending_hashes"]
-            entry["pending"] = None
-            entry["pending_hashes"] = None
-            promoted += 1
-            parent = entry.pop("parent", None)
-            if parent is not None and parent is not entry:
-                self.remove(parent)
+        reaped = []        # 待回收的父条目,锁外统一 remove
+        done = []          # (prefix_len, orig_len, had_parent),锁外打印,不在锁内做日志 IO
+        with self._lock:
+            for entry in self._compressions:  # 已持锁,_compressions 成员不会被并发改,无需拷贝
+                if entry.get("pending") is None:
+                    continue
+                entry["prefix"] = entry["pending"]
+                entry["original_hashes"] = entry["pending_hashes"]
+                entry["pending"] = None
+                entry["pending_hashes"] = None
+                promoted += 1
+                parent = entry.pop("parent", None)
+                if parent is not None and parent is not entry:
+                    reaped.append(parent)
+                done.append((len(entry["prefix"]), len(entry["original_hashes"]), parent is not None))
+        for parent in reaped:
+            self.remove(parent)  # remove 自带锁;放锁外避免对不可重入 Lock 二次获取
+        for prefix_len, orig_len, had_parent in done:
             log.info(
-                f"[MSG] Compression promoted: {len(entry['prefix'])} prefix messages "
-                f"replacing {len(entry['original_hashes'])} originals"
-                f"{' (reaped 1 parent)' if parent is not None else ''}"
+                f"[MSG] Compression promoted: {prefix_len} prefix messages "
+                f"replacing {orig_len} originals"
+                f"{' (reaped 1 parent)' if had_parent else ''}"
             )
         if promoted:
             self.persist()  # 转正即落盘,重启后免冷启动满历史发送
@@ -1716,24 +1750,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 仍能在撞墙前主动压,而非永不触发、退化到 400 emergency 兜底。
             eff_trigger = _effective_trigger(req_headers)
             if total_input > 0 and total_input > eff_trigger:
-                already_compressing = any(
-                    (e["thread"] is not None and e["thread"].is_alive())
-                    or e.get("pending") is not None
-                    or e.get("intent_hashes") is not None
-                    for e in store.compressions
-                )
-                # 去重:covers 排除注入所用的条目(injected_via),只检查有没有「更新」的压缩覆盖同一段。
-                # 已注入且仅有注入条目覆盖 → 需进一步压缩(redundant=False);已注入但更新条目也覆盖
-                # → 冗余(下一发自动用新条目,不必重复压)。未注入时 injected_via=None,等价全量检查。
+                # 去重 + 登记意图原子完成:claim_compression 在一把锁内先 covers(排除本请求注入所用的
+                # 条目 injected_via),没有「更新」的压缩覆盖同一段才建条目、登记 intent_hashes 并返回它;
+                # 已覆盖则返回 None。exclude 的意义:已注入且仅注入条目覆盖 → 仍需进一步压缩;已注入但
+                # 有更新条目也覆盖 → 冗余(下一发自动用新条目)。未注入时 injected_via=None,等价全量检查。
+                # 这把「检查→登记」收进锁内,同时取代了原全局 already_compressing(粗粒度、有 TOCTOU、
+                # 会跨会话误挡):covers 现已覆盖 intent/pending/original 全生命周期,且与 promote/
+                # find_match 同锁互斥,成为唯一、精确、无竞争的去重判定。
                 injected_via = match if match is not None else (emergency_entry or proactive_entry)
-                redundant = store.covers(msg_hashes, exclude=injected_via)
-                if redundant and not already_compressing:
+                entry = store.claim_compression(msg_hashes, exclude=injected_via)
+                if entry is None:
                     log.info(
                         f"[MSG] API reported {total_input:,} tokens (> trigger {eff_trigger:,}), "
-                        f"but a matching compression already exists — skipping redundant compression "
-                        f"(in-flight full request returned after its compression landed)"
+                        f"but a matching compression already exists — skipping redundant compression"
                     )
-                if not already_compressing and not redundant:
+                else:
                     win = _request_window(req_headers)
                     capped = " capped" if eff_trigger < TRIGGER_TOKENS else ""
                     log.info(
@@ -1741,10 +1772,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         f"(trigger: {eff_trigger:,}{capped}, window {win:,}). "
                         f"Compressing in background..."
                     )
-                    entry = store.add()
-                    entry["intent_hashes"] = msg_hashes
                     entry["pre_tokens"] = total_input
-                    entry["parent"] = match if match is not None else (emergency_entry or proactive_entry)
+                    entry["parent"] = injected_via  # 注入所用条目即新压缩的父,转正时回收
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),

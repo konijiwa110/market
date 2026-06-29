@@ -214,6 +214,65 @@ class StoreCovers(unittest.TestCase):
         self.assertFalse(s.covers(["a", "b"]))
 
 
+class ClaimCompression(unittest.TestCase):
+    """store.claim_compression():一把锁内原子完成「去重检查 + 登记压缩意图」。没有更新的压缩覆盖
+    同一段才建条目、写 intent_hashes 并返回它,否则返回 None。取代原全局 already_compressing,
+    关掉两个并发请求各自通过 covers 后重复触发同一段压缩的 TOCTOU 窗口。"""
+
+    def test_empty_store_claims_and_registers_intent(self):
+        s = server.CompressionStore()
+        e = s.claim_compression(["a", "b", "c"])
+        self.assertIsNotNone(e)
+        self.assertEqual(e["intent_hashes"], ["a", "b", "c"])
+        self.assertIs(s.compressions[-1], e)
+
+    def test_claim_blocked_by_promoted_chain(self):
+        s = server.CompressionStore()
+        e = s.add()
+        e["original_hashes"] = ["bbb", "ccc"]
+        e["prefix"] = [{"role": "user", "content": "S"}]
+        self.assertIsNone(s.claim_compression(["aaa", "bbb", "ccc", "ddd"]))
+
+    def test_claim_blocked_by_pending_chain(self):
+        s = server.CompressionStore()
+        e = s.add()
+        e["pending_hashes"] = ["bbb", "ccc"]
+        e["pending"] = [{"role": "user", "content": "S"}]
+        self.assertIsNone(s.claim_compression(["aaa", "bbb", "ccc"]))
+
+    def test_claim_blocked_by_inflight_intent(self):
+        # 另一在途压缩刚登记 intent(还没出 pending):并发的第二个请求同段不应再被 claim
+        s = server.CompressionStore()
+        first = s.claim_compression(["aaa", "bbb", "ccc"])
+        self.assertIsNotNone(first)
+        second = s.claim_compression(["aaa", "bbb", "ccc", "ddd"])  # 尾部多一条的紧邻请求
+        self.assertIsNone(second)
+        self.assertEqual(len(s.compressions), 1, "intent 已登记,不应重复建第二条")
+
+    def test_claim_succeeds_when_only_excluded_entry_covers(self):
+        # 仅「注入所用条目」覆盖时,排除它 → 仍需进一步压缩,claim 应放行
+        s = server.CompressionStore()
+        injected = s.add()
+        injected["original_hashes"] = ["bbb", "ccc"]
+        injected["prefix"] = [{"role": "user", "content": "S"}]
+        e = s.claim_compression(["aaa", "bbb", "ccc", "ddd"], exclude=injected)
+        self.assertIsNotNone(e)
+        self.assertEqual(e["intent_hashes"], ["aaa", "bbb", "ccc", "ddd"])
+
+    def test_claim_blocked_when_newer_entry_also_covers(self):
+        # 已注入 injected,但库里另有更新条目 newer 也覆盖同段 → 冗余,claim 应挡下
+        s = server.CompressionStore()
+        injected = s.add()
+        injected["original_hashes"] = ["aaa", "bbb"]
+        injected["prefix"] = [{"role": "user", "content": "S0"}]
+        newer = s.add()
+        newer["original_hashes"] = ["ccc", "ddd"]
+        newer["prefix"] = [{"role": "user", "content": "S1"}]
+        self.assertIsNone(
+            s.claim_compression(["aaa", "bbb", "ccc", "ddd", "eee"], exclude=injected)
+        )
+
+
 class PromoteReaping(unittest.TestCase):
     """promote_pending reaps the parent so each session keeps only 1 live entry."""
 
