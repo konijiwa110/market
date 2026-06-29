@@ -417,6 +417,7 @@ class CompressionStore:
                 "prefix": prefix,
                 "pending": None,
                 "pending_hashes": None,
+                "intent_hashes": None,
                 "thread": None,
                 "used": bool(d.get("used", True)),
                 "pre_tokens": int(d.get("pre_tokens", 0) or 0),
@@ -498,14 +499,15 @@ class CompressionStore:
                 return
         log.debug(f"[MATCH] No match among {len(self._compressions)} stored compression(s)")
 
-    def covers(self, msg_hashes: list) -> bool:
-        """库里是否已有压缩(已转正的 original_hashes,或刚算完待转正的 pending_hashes)其哈希链出现在
-        msg_hashes 中。只读、不改状态。用途:在途的慢全量请求(发出时压缩还没就绪 → 没注入、原样发)
-        回来时,覆盖它的压缩往往已完成入库,下一发就会注入它;此时不应再触发一条近乎重复的新压缩。
-        同时查 pending 是为了关掉「压缩已完成但尚未被下一发 promote」的那段窗口。"""
+    def covers(self, msg_hashes: list, exclude=None) -> bool:
+        """库里是否已有压缩其哈希链出现在 msg_hashes 中(排除 exclude 指向的条目)。
+        检查顺序:original_hashes(已转正) → pending_hashes(待转正) → intent_hashes(刚声明意图),
+        三者覆盖从触发到转正的全生命周期。"""
         with self._lock:
             for entry in self._compressions:
-                oh = entry["original_hashes"] or entry.get("pending_hashes")
+                if entry is exclude:
+                    continue
+                oh = entry["original_hashes"] or entry.get("pending_hashes") or entry.get("intent_hashes")
                 if not oh:
                     continue
                 chain_len = len(oh)
@@ -520,6 +522,7 @@ class CompressionStore:
             "prefix": None,          # compressed replacement messages
             "pending": None,         # pending compression result
             "pending_hashes": None,  # hashes for pending
+            "intent_hashes": None,   # 触发时立即写入的原始 msg_hashes;pending_hashes 写入后清空
             "thread": None,          # background compression thread
             "used": False,           # 是否已被某个请求注入过(用于标记「压缩生效的第一个请求」)
             "pre_tokens": 0,         # 触发本次压缩时的上下文 token 数(压缩前规模,用于展示收缩效果)
@@ -539,7 +542,7 @@ class CompressionStore:
 
         def busy(e):
             t = e.get("thread")
-            return t is not None and t.is_alive()
+            return (t is not None and t.is_alive()) or e.get("intent_hashes") is not None or e.get("pending") is not None
 
         alive = [e for e in self._compressions if busy(e)]
         idle = [e for e in self._compressions if not busy(e)]
@@ -1004,6 +1007,7 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
         # 转正信号,故 pending 一旦可见就必须保证 pending_hashes 已就绪——否则会读到半成品、
         # 把 original_hashes 置空,这条压缩白丢还留个永不命中的死条目。
         entry["pending_hashes"] = key_hashes
+        entry["intent_hashes"] = None  # pending_hashes 接棒,intent 使命完成
         entry["_debug_messages"] = summarized  # for mismatch debugging
         entry["pending"] = prefix
         log.info(
@@ -1015,6 +1019,7 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
     except Exception as e:
         log.error(f"[BG] Compression failed: {e}", exc_info=True)
         entry["pending"] = None
+        entry["intent_hashes"] = None
 
 
 def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg_chars: int):
@@ -1712,14 +1717,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             eff_trigger = _effective_trigger(req_headers)
             if total_input > 0 and total_input > eff_trigger:
                 already_compressing = any(
-                    e["thread"] is not None and e["thread"].is_alive()
+                    (e["thread"] is not None and e["thread"].is_alive())
+                    or e.get("pending") is not None
+                    or e.get("intent_hashes") is not None
                     for e in store.compressions
                 )
-                # 去重:仅对「未注入」的请求做覆盖判定。在途的慢全量请求发出时压缩还没就绪 → 没注入、原样
-                # 发到上游,回来时 total_input 仍是旧的全量值、又超 trigger;但覆盖它的压缩此刻往往已完成入库
-                # (下一发就会注入),不应再压一遍 → 否则产出近乎重复的第二条压缩。已注入仍超限是「需进一步
-                # 压缩」的正当场景,不在此列(其 msg_hashes 对应原始消息,covers 会误判,故用 not injected 守住)。
-                redundant = (not injected) and store.covers(msg_hashes)
+                # 去重:covers 排除注入所用的条目(injected_via),只检查有没有「更新」的压缩覆盖同一段。
+                # 已注入且仅有注入条目覆盖 → 需进一步压缩(redundant=False);已注入但更新条目也覆盖
+                # → 冗余(下一发自动用新条目,不必重复压)。未注入时 injected_via=None,等价全量检查。
+                injected_via = match if match is not None else (emergency_entry or proactive_entry)
+                redundant = store.covers(msg_hashes, exclude=injected_via)
                 if redundant and not already_compressing:
                     log.info(
                         f"[MSG] API reported {total_input:,} tokens (> trigger {eff_trigger:,}), "
@@ -1735,9 +1742,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         f"Compressing in background..."
                     )
                     entry = store.add()
-                    entry["pre_tokens"] = total_input  # 压缩前规模,注入生效时展示收缩效果
-                    # 本次压缩建立在已注入的条目之上;转正后那条即死条目,回收掉。常态是 match;
-                    # 若这发走了 emergency 同步兜底(match 必为 None),则父是 emergency 登记的条目。
+                    entry["intent_hashes"] = msg_hashes
+                    entry["pre_tokens"] = total_input
                     entry["parent"] = match if match is not None else (emergency_entry or proactive_entry)
                     t = threading.Thread(
                         target=_do_background_compression,

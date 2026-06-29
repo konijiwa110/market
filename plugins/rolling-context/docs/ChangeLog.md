@@ -1,5 +1,22 @@
 # ChangeLog
 
+## 1.17.4 — 修复后台压缩去重:已注入旧前缀的请求不再重复触发 haiku 压缩
+
+### 背景
+会话高频往返时,请求 A 触发后台压缩后,紧随的请求 B 注入旧前缀转发上游;B 的响应回来时,压缩已由其他会话 promote 转正,
+但触发判断中 `redundant = (not injected) and store.covers(msg_hashes)` 因 `not injected` 短路了 covers 检查,
+看不到已落地的新压缩,导致对同一段消息再发一次几乎相同的 haiku 压缩。
+
+### 变更(`proxy/server.py`)
+- **covers() 加 exclude 参数**:允许已注入请求排除自己注入所用的条目,只检查有无**更新**条目覆盖同一段。
+  `oh` 链扩展为 `original_hashes → pending_hashes → intent_hashes`,覆盖从声明意图到转正的全生命周期。
+- **redundant 改为 `store.covers(msg_hashes, exclude=injected_via)`**:未注入时 exclude=None(等价全量检查);
+  已注入时排除注入条目——有更新条目覆盖则冗余(跳过),仅有注入条目自身覆盖则是正当的"需进一步压缩"。
+- **intent_hashes 意图登记**:store.add() 后、起线程前立即写入 `entry["intent_hashes"] = msg_hashes`,
+  关闭从声明压缩到线程写 pending_hashes 的空窗;线程完成或失败时清空。
+- **already_compressing 加 pending/intent 检查**:覆盖 thread alive → pending 待转正 → intent 已声明的全生命周期。
+- **_prune_locked busy() 扩展**:有 intent_hashes 或 pending 的条目也视为在途,不误剪。
+
 ## 1.17.0 — 输出明细拆分(thinking/text/tool_use)+ 大输出/长耗时回合整份归档备查
 
 ### 背景
