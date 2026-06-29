@@ -98,6 +98,7 @@ Drop a `~/.claude/rolling-context.json` to override defaults. Every key is **con
 | Proactive compression | `proactive_compress` | `ROLLING_CONTEXT_PROACTIVE_COMPRESS` (default `1` = on) |
 | Emergency compression | `emergency_compress` | `ROLLING_CONTEXT_EMERGENCY_COMPRESS` (default `1` = on) |
 | Listen port | `port` | `ROLLING_CONTEXT_PORT` (default `5588`) |
+| Listen host | `host` | `ROLLING_CONTEXT_HOST` (default `127.0.0.1`, loopback only). Set `0.0.0.0` to let other devices on your LAN reach the proxy/dashboard. ⚠️ The proxy forwards your `ANTHROPIC_AUTH_TOKEN`, so anyone who can reach the port can spend your key and read the traffic — only expose it on a trusted network, never the public internet. |
 
 The proxy can't see your model's real context limit, only the request body — so the effective trigger is automatically capped at **90% of the detected window** so a `trigger` set above your real limit can't silently disable compression. The window is detected per request from the `anthropic-beta` header (`context-1m-*` → 1M, otherwise 200k, matching how Claude Code's `model[1m]` alias works). Set `context_window` only when a third-party endpoint advertises 1M via the header but actually caps lower — pin it (e.g. `200000`) to override the header detection.
 
