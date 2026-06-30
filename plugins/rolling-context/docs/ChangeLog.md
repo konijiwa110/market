@@ -1,5 +1,15 @@
 # ChangeLog
 
+## 1.18.1 — 版本号推进,让客户端识别到 1.18 的 marketplace 元数据修复
+
+### 背景
+1.18.0 首发后补了 `.claude-plugin/marketplace.json` 的 `version` 字段(插件市场列表页的版本来源),但当时版本号
+仍停在 1.18.0;客户端版本闸门「只升不降」,已装 1.18.0 的客户端不会把「同号但元数据变了」识别为更新。
+
+### 变更
+- `plugin.json` 与 `.claude-plugin/marketplace.json` 的 `version` → 1.18.1,仅推进 patch 号,使上述元数据修复 +
+  1.18.0 的客户端伪装功能一并被 `/plugin marketplace update` → `/plugin update` 识别并拉取。**无代码 / 行为变更。**
+
 ## 1.18.0 — 客户端伪装增强:代理自发请求套用「最近大请求」的真实客户端头
 
 ### 背景
