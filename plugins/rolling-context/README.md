@@ -97,6 +97,7 @@ Drop a `~/.claude/rolling-context.json` to override defaults. Every key is **con
 | Context window override | `context_window` | `ROLLING_CONTEXT_CONTEXT_WINDOW` (default `0` = auto-detect from the `anthropic-beta` header) |
 | Proactive compression | `proactive_compress` | `ROLLING_CONTEXT_PROACTIVE_COMPRESS` (default `1` = on) |
 | Emergency compression | `emergency_compress` | `ROLLING_CONTEXT_EMERGENCY_COMPRESS` (default `1` = on) |
+| Client disguise | `disguise_client` | `ROLLING_CONTEXT_DISGUISE` (default `1` = on). Proxy-initiated requests (compression / emergency) reuse the client headers (UA / `x-app` / `x-stainless-*` / `anthropic-*`) of the most recent over-`target` request so they look like genuine Claude Code traffic to the upstream `claude_code_only` check; auth headers always come from the live request. Set `0` to pass through the triggering request's own headers instead. |
 | Listen port | `port` | `ROLLING_CONTEXT_PORT` (default `5588`) |
 | Listen host | `host` | `ROLLING_CONTEXT_HOST` (default `127.0.0.1`, loopback only). Set `0.0.0.0` to let other devices on your LAN reach the proxy/dashboard. ⚠️ The proxy forwards your `ANTHROPIC_AUTH_TOKEN`, so anyone who can reach the port can spend your key and read the traffic — only expose it on a trusted network, never the public internet. |
 

@@ -886,5 +886,99 @@ class RedundantCompressionSkip(unittest.TestCase):
         self.assertEqual(len(server.store.compressions), 1)
 
 
+class DisguiseClient(unittest.TestCase):
+    """客户端伪装:_apply_disguise 三态 + _maybe_capture_disguise 刷新条件。"""
+
+    def setUp(self):
+        self._orig_flag = server.DISGUISE_CLIENT
+        self._orig_tmpl = server._disguise_template
+        server._disguise_template = None
+
+    def tearDown(self):
+        server.DISGUISE_CLIENT = self._orig_flag
+        server._disguise_template = self._orig_tmpl
+
+    def test_apply_passthrough_when_disabled(self):
+        server.DISGUISE_CLIENT = False
+        server._disguise_template = {"user-agent": "claude-cli/1.0.83"}
+        auth = {"authorization": "Bearer x", "user-agent": "py"}
+        self.assertEqual(server._apply_disguise(auth), auth)
+
+    def test_apply_passthrough_when_no_template(self):
+        server.DISGUISE_CLIENT = True
+        server._disguise_template = None
+        auth = {"authorization": "Bearer x", "user-agent": "py"}
+        self.assertEqual(server._apply_disguise(auth), auth)
+
+    def test_apply_uses_template_but_keeps_auth(self):
+        server.DISGUISE_CLIENT = True
+        server._disguise_template = {
+            "user-agent": "claude-cli/1.0.83",
+            "x-app": "cli",
+            "x-stainless-os": "MacOS",
+            "anthropic-version": "2023-06-01",
+        }
+        auth = {
+            "authorization": "Bearer SECRET",
+            "x-api-key": "KEY",
+            "user-agent": "Python-urllib/3.12",
+            "anthropic-version": "2023-06-01",
+        }
+        out = server._apply_disguise(auth)
+        self.assertEqual(out["user-agent"], "claude-cli/1.0.83")
+        self.assertEqual(out["x-app"], "cli")
+        self.assertEqual(out["x-stainless-os"], "MacOS")
+        self.assertEqual(out["authorization"], "Bearer SECRET")
+        self.assertEqual(out["x-api-key"], "KEY")
+
+    def test_capture_refreshes_on_large_request(self):
+        server.DISGUISE_CLIENT = True
+        big = server.TARGET_TOKENS * 4 + 8
+        headers = {
+            "user-agent": "claude-cli/1.0.83",
+            "authorization": "Bearer SECRET",
+            "x-api-key": "KEY",
+            "host": "127.0.0.1",
+            "content-length": "999",
+            "accept-encoding": "gzip",
+            "x-app": "cli",
+        }
+        server._maybe_capture_disguise(headers, big, is_count=False)
+        tmpl = server._disguise_template
+        self.assertIsNotNone(tmpl)
+        self.assertEqual(tmpl["user-agent"], "claude-cli/1.0.83")
+        self.assertEqual(tmpl["x-app"], "cli")
+        for k in ("authorization", "x-api-key", "host", "content-length", "accept-encoding"):
+            self.assertNotIn(k, tmpl)
+
+    def test_capture_ignores_small_request(self):
+        server.DISGUISE_CLIENT = True
+        server._maybe_capture_disguise({"user-agent": "small"}, 100, is_count=False)
+        self.assertIsNone(server._disguise_template)
+
+    def test_capture_ignores_count_tokens(self):
+        server.DISGUISE_CLIENT = True
+        big = server.TARGET_TOKENS * 4 + 8
+        server._maybe_capture_disguise({"user-agent": "probe"}, big, is_count=True)
+        self.assertIsNone(server._disguise_template)
+
+    def test_capture_noop_when_disabled(self):
+        server.DISGUISE_CLIENT = False
+        big = server.TARGET_TOKENS * 4 + 8
+        server._maybe_capture_disguise({"user-agent": "x"}, big, is_count=False)
+        self.assertIsNone(server._disguise_template)
+
+    def test_capture_then_apply_uses_large_request_ua(self):
+        server.DISGUISE_CLIENT = True
+        big = server.TARGET_TOKENS * 4 + 8
+        server._maybe_capture_disguise(
+            {"user-agent": "claude-cli/1.0.83", "authorization": "Bearer BIG"},
+            big, is_count=False,
+        )
+        out = server._apply_disguise({"authorization": "Bearer CUR", "x-api-key": "K"})
+        self.assertEqual(out["user-agent"], "claude-cli/1.0.83")
+        self.assertEqual(out["authorization"], "Bearer CUR")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

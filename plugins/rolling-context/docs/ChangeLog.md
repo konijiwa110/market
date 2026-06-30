@@ -1,5 +1,33 @@
 # ChangeLog
 
+## 1.18.0 — 客户端伪装增强:代理自发请求套用「最近大请求」的真实客户端头
+
+### 背景
+代理自发的请求(后台压缩、emergency 兜底)此前用**触发那一刻请求的透传头**发给上游 haiku。多数场景没问题,但
+触发请求本身可能是个小请求(头部并不完整),而上游中转的 `claude_code_only` 校验看的是 UA / `x-app` /
+`x-stainless-*` / `anthropic-*` 这组「像不像真 Claude Code 客户端」的头。用小请求的头去发,偶发被判非客户端流量。
+
+### 变更(`proxy/server.py`)
+- **伪装模板缓存**:每个超 `target` 阈值的**真实大请求**经过时(`_maybe_capture_disguise`),把它的完整客户端头
+  (UA/`x-app`/`x-stainless-*`/`anthropic-version`/`anthropic-beta` 等)快照进进程级模板 `_disguise_template`
+  (`_disguise_lock` 跨线程保护)。鉴权(`authorization`/`x-api-key`)与逐请求易变的连接/编码头
+  (`host`/`content-length`/`transfer-encoding`/`accept-encoding`)**不进模板**。token-count 探测请求不刷新模板。
+- **`_apply_disguise(auth_headers)`**:代理自发请求发出前,用模板替换头、**但鉴权仍用当次请求的**;
+  后台压缩(`_do_background_compression`)与 emergency 兜底(`_emergency_compress`)各在调上游前套用一次。
+  `model` 仍由压缩器强制 haiku、`anthropic-beta` 的 `1m` 仍由 `_strip_unsupported_1m_beta` 剥离,不受影响。
+- **开关**:`disguise_client` / `ROLLING_CONTEXT_DISGUISE`,默认 `1`(开)。设 `0/false/off` 退回
+  「用当次触发请求透传头」的旧行为。启动日志新增 `Disguise client: on/off` 一行。
+- **安全回退**:开关关、或尚无大请求填过模板时,`_apply_disguise` 原样返回当次透传头,不影响压缩。
+
+### 不做 TLS 指纹
+入站是本地明文 HTTP(无 TLS 握手可采),出站用 Python stdlib `ssl`(JA3/JA4 固定且不可逐字段定制),
+模板化 TLS 伪装需换 `curl_cffi`/`tls-client` 重依赖且无 Claude Code(Node)预设——本版只做 HTTP 头伪装。
+
+### 测试
+新增 `DisguiseClient` 9 例:`_apply_disguise` 三态(开关关 / 无模板 / 有模板替换头但保鉴权)+
+`_maybe_capture_disguise` 刷新条件(大请求刷新 / 小请求不刷新 / count 探测不刷新 / 开关关不刷新 / 排除鉴权连接头)
++ 端到端「大请求捕获→自发请求套 UA」;全套 88 测试通过。
+
 ## 1.17.4 — 修复后台压缩去重:已注入旧前缀的请求不再重复触发 haiku 压缩
 
 ### 背景

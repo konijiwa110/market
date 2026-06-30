@@ -196,6 +196,16 @@ EMERGENCY_COMPRESS = str(_cfg("emergency_compress", "ROLLING_CONTEXT_EMERGENCY_C
 # 默认开;设 0/false/off 关闭,回到「先全量发、后台压」的旧行为。
 PROACTIVE_COMPRESS = str(_cfg("proactive_compress", "ROLLING_CONTEXT_PROACTIVE_COMPRESS", "1")).lower() not in ("0", "false", "off", "no")
 
+# 客户端伪装增强:代理自发请求(后台压缩 / emergency 兜底)默认套用「最近一个超 TARGET 大请求」的完整
+# 真实头(UA/x-app/x-stainless-*/anthropic-* 等)作伪装模板,鉴权仍用当次请求的,以更稳地通过上游
+# claude_code_only 检测。默认开;设 0/false/off 退回「用当次触发请求透传头」的旧行为。
+DISGUISE_CLIENT = str(_cfg("disguise_client", "ROLLING_CONTEXT_DISGUISE", "1")).lower() not in ("0", "false", "off", "no")
+# 伪装模板:进程级缓存最近一个大请求的伪装头(读写跨线程,_disguise_lock 保护)。鉴权与逐请求易变的连接/
+# 编码头不进模板(content-length/accept-encoding 由 compressor 发送时各自重设)。
+_disguise_lock = threading.Lock()
+_disguise_template = None  # dict | None
+_DISGUISE_SKIP = ("authorization", "x-api-key", "host", "content-length", "transfer-encoding", "accept-encoding")
+
 # 大请求归档(便于事后审查「它到底输出了啥」):对大输出或长耗时的回合,把完整请求体 + 完整响应内容
 # 单独落一份 gzip 存档。透传字节流不动,只读 buffer 副本;归档在响应已全量回给 CC、落库之前触发,
 # 失败绝不影响请求。总量滚动封顶防无界增长。默认开;设 0/false/off 关闭。
@@ -947,6 +957,34 @@ def get_passthrough_headers(req_headers: dict) -> dict:
     return headers
 
 
+def _apply_disguise(auth_headers: dict) -> dict:
+    """代理自发请求(后台压缩 / emergency 兜底)用「最近大请求」的伪装头模板替换头,鉴权仍用当次请求的。
+    开关关或尚无模板时原样返回(安全回退到当次透传头,不破坏压缩)。"""
+    if not DISGUISE_CLIENT:
+        return auth_headers
+    with _disguise_lock:
+        tmpl = dict(_disguise_template) if _disguise_template else None
+    if not tmpl:
+        return auth_headers
+    out = dict(tmpl)
+    for k, v in auth_headers.items():
+        if k.lower() in ("authorization", "x-api-key"):
+            out[k] = v
+    return out
+
+
+def _maybe_capture_disguise(req_headers: dict, raw_body_len: int, is_count: bool) -> None:
+    """超 TARGET 的真实大请求 → 刷新伪装模板(排除鉴权/连接编码头)。注入后的小请求不超阈值,不污染模板。"""
+    if not DISGUISE_CLIENT or is_count:
+        return
+    if _estimate_body_tokens(raw_body_len) <= TARGET_TOKENS:
+        return
+    tmpl = {k: v for k, v in req_headers.items() if k.lower() not in _DISGUISE_SKIP}
+    global _disguise_template
+    with _disguise_lock:
+        _disguise_template = tmpl
+
+
 def _request_window(req_headers: dict) -> int:
     """判出本请求的真实上下文窗口上限(token)。config 的 context_window 显式覆盖优先(供第三方上游
     谎报 1M 时钉死);否则读 anthropic-beta 头:含 context-1m → 1M,否则 200k。req_headers 是原始
@@ -1019,6 +1057,7 @@ def _mark_cache_breakpoint(msg: dict) -> bool:
 
 def _do_background_compression(entry: dict, messages: list, auth_headers: dict, real_token_count: int = None, sess: str = "--------"):
     """Compress messages. Key = hashes of messages that were summarized (not kept verbatim)."""
+    auth_headers = _apply_disguise(auth_headers)  # 套「最近大请求」伪装头模板(开关关/无模板则原样)
     # 后台线程不继承请求线程的会话标签,显式重设,使 [BG]/压缩器日志归属到发起会话。
     _set_sess(sess)
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
@@ -1052,8 +1091,11 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
         )
     except Exception as e:
         log.error(f"[BG] Compression failed: {e}", exc_info=True)
+        # 压缩失败:显式移除本 entry,立即释放名额并与 prefix_len==0 直通分支保持一致。
+        # 留着也无害(三段哈希链为空,covers/find_match 不会命中),但等 prune 回收会多占一个槽。
         entry["pending"] = None
         entry["intent_hashes"] = None
+        store.remove(entry)
 
 
 def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg_chars: int):
@@ -1064,6 +1106,7 @@ def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg
     keep 比例的分母优先用错误体里上游自报的真实 token 数(最准,一次即压到上限内);解析不到再用
     msg_chars/3 粗估兜底。"""
     real = reported_tokens or (msg_chars // 3 if msg_chars else None)
+    auth_headers = _apply_disguise(auth_headers)  # 套「最近大请求」伪装头模板(开关关/无模板则原样)
     compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real)
     if prefix_len == 0:
         log.warning("[EMG] Nothing to compress (prefix_len=0); cannot shrink request")
@@ -1371,6 +1414,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         raw_body = self._read_body()
         req_headers = self._get_headers_dict()
         auth_headers = get_passthrough_headers(req_headers)
+        _maybe_capture_disguise(req_headers, len(raw_body), is_count)
 
         log.info(f"[MSG] POST {self.path} (body={len(raw_body)} bytes)")
         log.debug(f"[MSG] Request headers: {list(req_headers.keys())}")
@@ -1851,6 +1895,7 @@ def main():
     log.info(f"  Summarizer model: {SUMMARIZER_MODEL}")
     log.info(f"  Forwarding to: {UPSTREAM_URL}")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
+    log.info(f"  Disguise client: {'on (mimic latest large request headers)' if DISGUISE_CLIENT else 'off (passthrough current request headers)'}")
 
     # 绑定即锁:端口被占 = 已有实例在跑,干净退出(exit 0),绝不抢占成双实例。
     try:
