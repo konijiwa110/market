@@ -215,9 +215,14 @@ class StoreCovers(unittest.TestCase):
 
 
 class ClaimCompression(unittest.TestCase):
-    """store.claim_compression():一把锁内原子完成「去重检查 + 登记压缩意图」。没有更新的压缩覆盖
-    同一段才建条目、写 intent_hashes 并返回它,否则返回 None。取代原全局 already_compressing,
-    关掉两个并发请求各自通过 covers 后重复触发同一段压缩的 TOCTOU 窗口。"""
+    """store.claim_compression():一把锁内原子完成「去重检查 + 登记压缩意图」。去重口径由 in_flight_only
+    参数(调用方按「本发是否已注入压缩」给)决定:
+    - False(本发未注入,默认):已转正 original_hashes / 待转正 pending_hashes / 意图 intent_hashes
+      任一覆盖同段即跳过 —— 防在途落地的压缩被下一发近乎重复地再压一遍。
+    - True(本发已注入,find_match 用了最深条目却仍超 trigger,真需更深一层):只认在途(pending/
+      intent),不认已转正 —— 否则会话被自身旧压缩挡住、深压缩永不建立,一路涨到 CC autocompact
+      兜底(1.19.x 回归)。
+    取代原全局 already_compressing,关掉两个并发请求重复触发同一段压缩的 TOCTOU 窗口。"""
 
     def test_empty_store_claims_and_registers_intent(self):
         s = server.CompressionStore()
@@ -226,6 +231,7 @@ class ClaimCompression(unittest.TestCase):
         self.assertEqual(e["intent_hashes"], ["a", "b", "c"])
         self.assertIs(s.compressions[-1], e)
 
+    # --- 默认口径 in_flight_only=False(本发未注入):任何覆盖都挡下 ---
     def test_claim_blocked_by_promoted_chain(self):
         s = server.CompressionStore()
         e = s.add()
@@ -249,18 +255,8 @@ class ClaimCompression(unittest.TestCase):
         self.assertIsNone(second)
         self.assertEqual(len(s.compressions), 1, "intent 已登记,不应重复建第二条")
 
-    def test_claim_succeeds_when_only_excluded_entry_covers(self):
-        # 仅「注入所用条目」覆盖时,排除它 → 仍需进一步压缩,claim 应放行
-        s = server.CompressionStore()
-        injected = s.add()
-        injected["original_hashes"] = ["bbb", "ccc"]
-        injected["prefix"] = [{"role": "user", "content": "S"}]
-        e = s.claim_compression(["aaa", "bbb", "ccc", "ddd"], exclude=injected)
-        self.assertIsNotNone(e)
-        self.assertEqual(e["intent_hashes"], ["aaa", "bbb", "ccc", "ddd"])
-
     def test_claim_blocked_when_newer_entry_also_covers(self):
-        # 已注入 injected,但库里另有更新条目 newer 也覆盖同段 → 冗余,claim 应挡下
+        # 本发未注入时,库里另有更新条目 newer 也覆盖同段 → 冗余,claim 应挡下
         s = server.CompressionStore()
         injected = s.add()
         injected["original_hashes"] = ["aaa", "bbb"]
@@ -270,6 +266,46 @@ class ClaimCompression(unittest.TestCase):
         newer["prefix"] = [{"role": "user", "content": "S1"}]
         self.assertIsNone(
             s.claim_compression(["aaa", "bbb", "ccc", "ddd", "eee"], exclude=injected)
+        )
+
+    # --- 深压缩口径 in_flight_only=True(本发已注入却仍超 trigger):只认在途 ---
+    def test_claim_succeeds_when_only_excluded_entry_covers(self):
+        # 仅「注入所用条目」覆盖时,排除它 → 仍需进一步压缩,claim 应放行
+        s = server.CompressionStore()
+        injected = s.add()
+        injected["original_hashes"] = ["bbb", "ccc"]
+        injected["prefix"] = [{"role": "user", "content": "S"}]
+        e = s.claim_compression(["aaa", "bbb", "ccc", "ddd"], exclude=injected, in_flight_only=True)
+        self.assertIsNotNone(e)
+        self.assertEqual(e["intent_hashes"], ["aaa", "bbb", "ccc", "ddd"])
+
+    def test_claim_in_flight_only_ignores_completed_sibling(self):
+        # 复现 85df5cf0 回归:本发注入了 injected(已排除),库里另有【已转正】兄弟条目 sibling 也覆盖
+        # 前缀。旧行为:sibling 令 claim 返回 None → 深压缩永不建立,会话一路涨到 CC autocompact 兜底。
+        # 修复后 in_flight_only=True:已转正条目不参与去重 → claim 放行,建立更深压缩。
+        s = server.CompressionStore()
+        injected = s.add()
+        injected["original_hashes"] = ["aaa", "bbb"]
+        injected["prefix"] = [{"role": "user", "content": "S0"}]
+        sibling = s.add()
+        sibling["original_hashes"] = ["ccc", "ddd"]
+        sibling["prefix"] = [{"role": "user", "content": "S1"}]
+        claimed = s.claim_compression(
+            ["aaa", "bbb", "ccc", "ddd", "eee"], exclude=injected, in_flight_only=True
+        )
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["intent_hashes"], ["aaa", "bbb", "ccc", "ddd", "eee"])
+
+    def test_claim_in_flight_only_still_blocks_inflight_sibling(self):
+        # 边界:in_flight_only=True 忽略已转正,但同段的【在途】压缩仍要挡下(避免连发重复触发)
+        s = server.CompressionStore()
+        done = s.add()
+        done["original_hashes"] = ["aaa", "bbb"]
+        done["prefix"] = [{"role": "user", "content": "S"}]
+        inflight = s.add()
+        inflight["intent_hashes"] = ["aaa", "bbb", "ccc"]
+        self.assertIsNone(
+            s.claim_compression(["aaa", "bbb", "ccc", "ddd"], in_flight_only=True)
         )
 
 

@@ -516,13 +516,22 @@ class CompressionStore:
         with self._lock:
             return self._covers_locked(msg_hashes, exclude)
 
-    def _covers_locked(self, msg_hashes: list, exclude=None) -> bool:
+    def _covers_locked(self, msg_hashes: list, exclude=None, in_flight_only=False) -> bool:
         """covers 的无锁实现(调用者须已持 self._lock)。供 covers 与 claim_compression 复用,
-        使「检查去重 → 登记意图」能在同一临界区内原子完成。"""
+        使「检查去重 → 登记意图」能在同一临界区内原子完成。
+
+        in_flight_only=True 时只认「在途」压缩(intent_hashes / pending_hashes),忽略已转正的
+        original_hashes。claim_compression 走这条:已转正条目归 find_match 管——若本发注入了它却仍
+        超 trigger,恰恰证明需要「更深一层」的压缩,已转正条目绝不该把它挡下(否则会话只能一路涨到
+        CC autocompact 兜底)。只有「同段压缩已在途」才是真冗余,才拦。默认 False 保持 covers() 全生命
+        周期语义不变。"""
         for entry in self._compressions:
             if entry is exclude:
                 continue
-            oh = entry["original_hashes"] or entry.get("pending_hashes") or entry.get("intent_hashes")
+            if in_flight_only:
+                oh = entry.get("pending_hashes") or entry.get("intent_hashes")
+            else:
+                oh = entry["original_hashes"] or entry.get("pending_hashes") or entry.get("intent_hashes")
             if not oh:
                 continue
             chain_len = len(oh)
@@ -551,13 +560,21 @@ class CompressionStore:
             self._prune_locked()
         return entry
 
-    def claim_compression(self, msg_hashes: list, exclude=None):
-        """原子地「检查去重 + 登记压缩意图」:在一把锁内先 covers(排除注入所用条目 exclude),没有
-        「更新」的压缩覆盖同一段才新建条目、登记 intent_hashes 并入库,返回该条目;已被覆盖则返回 None。
-        把「检查→登记」收进同一临界区,杜绝两个并发请求各自通过 covers 后重复触发同一段压缩——
-        此前靠全局 already_compressing 粗粒度兜,既不精确(TOCTOU 仍漏)又会跨会话误挡。"""
+    def claim_compression(self, msg_hashes: list, exclude=None, in_flight_only=False):
+        """原子地「检查去重 + 登记压缩意图」:在一把锁内先查是否已被覆盖,没有才新建条目、登记
+        intent_hashes 并入库,返回该条目;已覆盖则返回 None。把「检查→登记」收进同一临界区,杜绝两个
+        并发请求各自重复触发同一段压缩——此前靠全局 already_compressing 粗粒度兜,既不精确(TOCTOU
+        仍漏)又会跨会话误挡。
+
+        in_flight_only 由调用方按「本发是否已注入压缩」决定:
+        - 本发已注入(injected_via 非空):find_match 已把【最深】的覆盖条目注入了,却仍 > trigger,
+          说明真需要更深一层;此时 in_flight_only=True,已转正条目(original_hashes)不得挡下,只让
+          【在途】压缩(intent/pending)去重。否则长会话被自身旧压缩挡住、深压缩永不建立,一路涨到
+          CC autocompact 兜底(1.19.x 回归)。
+        - 本发未注入(injected_via 为空):在途期间可能落地一条覆盖本段的压缩(下一发 find_match 会用
+          它),此时 in_flight_only=False,已转正条目也算覆盖 → 跳过,避免与那条近乎重复。"""
         with self._lock:
-            if self._covers_locked(msg_hashes, exclude=exclude):
+            if self._covers_locked(msg_hashes, exclude=exclude, in_flight_only=in_flight_only):
                 return None
             entry = self._new_entry()
             entry["intent_hashes"] = list(msg_hashes)
@@ -1799,15 +1816,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 仍能在撞墙前主动压,而非永不触发、退化到 400 emergency 兜底。
             eff_trigger = _effective_trigger(req_headers)
             if total_input > 0 and total_input > eff_trigger:
-                # 去重 + 登记意图原子完成:claim_compression 在一把锁内先 covers(排除本请求注入所用的
-                # 条目 injected_via),没有「更新」的压缩覆盖同一段才建条目、登记 intent_hashes 并返回它;
-                # 已覆盖则返回 None。exclude 的意义:已注入且仅注入条目覆盖 → 仍需进一步压缩;已注入但
-                # 有更新条目也覆盖 → 冗余(下一发自动用新条目)。未注入时 injected_via=None,等价全量检查。
-                # 这把「检查→登记」收进锁内,同时取代了原全局 already_compressing(粗粒度、有 TOCTOU、
-                # 会跨会话误挡):covers 现已覆盖 intent/pending/original 全生命周期,且与 promote/
-                # find_match 同锁互斥,成为唯一、精确、无竞争的去重判定。
+                # 去重 + 登记意图原子完成:claim_compression 在一把锁内查是否已被覆盖,没有才建条目、
+                # 登记 intent_hashes 并返回它;已覆盖则返回 None。in_flight_only 按「本发是否注入了压缩」
+                # 决定去重口径(见 claim_compression docstring):
+                # - 本发已注入(injected_via 非空):find_match 已注入最深覆盖条目却仍 > trigger → 真需
+                #   更深一层,去重【不】看已转正 original_hashes,只挡在途(intent/pending)。否则会话被
+                #   自身旧压缩挡住、深压缩永不建立,一路涨到 CC autocompact 兜底(1.19.x 回归)。
+                # - 本发未注入:在途期间可能落地覆盖本段的压缩(下一发 find_match 会用),已转正条目也算
+                #   覆盖 → 跳过,避免近乎重复。这把「检查→登记」收进锁内,取代原全局 already_compressing。
                 injected_via = match if match is not None else (emergency_entry or proactive_entry)
-                entry = store.claim_compression(msg_hashes, exclude=injected_via)
+                entry = store.claim_compression(
+                    msg_hashes, exclude=injected_via, in_flight_only=injected_via is not None
+                )
                 if entry is None:
                     log.info(
                         f"[MSG] API reported {total_input:,} tokens (> trigger {eff_trigger:,}), "
