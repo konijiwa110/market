@@ -1273,6 +1273,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             1 for e in store.compressions
             if e["thread"] is not None and e["thread"].is_alive()
         )
+        # 在途转发数:供 hook 升级闸门「排空再杀」判定——旧代理正为某会话流式转发时先等它跑完再替换,
+        # 避免硬杀切断在途 SSE(对端 RST → 旧会话看到 502)。
+        with _inflight_lock:
+            inflight = len(_inflight)
         data = {
             "status": "ok",
             "version": VERSION,
@@ -1285,6 +1289,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "total_tokens_saved": compressor.total_tokens_saved,
             "stored_compressions": len(store.compressions),
             "active_compressions": active,
+            "inflight": inflight,
         }
         body = json.dumps(data).encode()
         self.send_response(200)

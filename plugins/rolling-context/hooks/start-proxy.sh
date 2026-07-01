@@ -81,6 +81,19 @@ except Exception:
 PYEOF
 }
 
+# 在途转发数:供升级排空判定。/health 不通或字段缺失一律当 0(不阻塞替换)。
+proxy_inflight() {
+    _py - "$PROXY_URL" <<'PYEOF'
+import sys, json, urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1] + "/health", timeout=2) as r:
+        d = json.load(r)
+    print(int(d.get("inflight", 0) or 0))
+except Exception:
+    print(0)
+PYEOF
+}
+
 _kill_pid() {
     local pid="$1"
     [ -z "$pid" ] && return 0
@@ -137,6 +150,16 @@ if [ -n "$HEALTH" ]; then
         log "Proxy healthy (PID $RUNNING_PID, v$RUNNING_VERSION >= v$CURRENT_VERSION) - reusing"
         PROXY_HEALTHY=true
     else
+        # 排空再杀:旧代理可能正为某个还开着的旧会话做流式转发。硬杀会切断在途 SSE → 对端收 RST、旧会话
+        # 看到 502。先轮询旧代理 /health 的 inflight,等它把手上的请求跑完再杀;封顶 10 秒(SessionStart
+        # hook 总超时 30s,须给后续启动+轮询留足)——超时仍硬杀,超长流被切是有意取舍。
+        for d in 1 2 3 4 5 6 7 8 9 10; do
+            INFLIGHT=$(proxy_inflight)
+            [ -z "$INFLIGHT" ] && INFLIGHT=0
+            [ "$INFLIGHT" -le 0 ] 2>/dev/null && break
+            [ "$d" = "1" ] && log "Draining old proxy (v${RUNNING_VERSION:-?}, PID $RUNNING_PID): $INFLIGHT in-flight; waiting up to 10s before restart"
+            sleep 1
+        done
         log "Restarting proxy (running v${RUNNING_VERSION:-?} -> v$CURRENT_VERSION; stopping PID $RUNNING_PID)"
         _kill_pid "$RUNNING_PID"
         sleep 1

@@ -100,6 +100,16 @@ if ($health) {
         $proxyHealthy = $true
     } else {
         $rv = if ($runningVersion) { $runningVersion } else { '?' }
+        # 排空再杀:要换掉在跑的旧代理,但它可能正为某个还开着的旧会话做流式转发。硬杀会切断在途 SSE →
+        # 对端收 RST、旧会话看到 502。先轮询旧代理 /health 的 inflight,等它把手上的请求跑完再杀;封顶
+        # 10 秒(SessionStart hook 总超时 30s,须给后续启动+轮询留足)——超时仍硬杀,超长流被切是有意取舍。
+        for ($d = 0; $d -lt 10; $d++) {
+            $inflight = 0
+            try { $inflight = [int]("$((Get-Health).inflight)") } catch { $inflight = 0 }
+            if ($inflight -le 0) { break }
+            if ($d -eq 0) { Log "Draining old proxy (v$rv, PID $($health.pid)): $inflight in-flight; waiting up to 10s before restart" }
+            Start-Sleep -Seconds 1
+        }
         Log "Restarting proxy (running v$rv -> v$CurrentVersion; stopping PID $($health.pid))"
         if ($health.pid) { Stop-Process -Id ([int]$health.pid) -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Seconds 1
