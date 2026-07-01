@@ -1051,6 +1051,22 @@ def _validate_tool_pairs(messages: list) -> list:
     return messages[valid_from:]
 
 
+def _injection_is_safe(merged: list) -> bool:
+    """注入产物结构自检:防止发给上游的消息畸形(问题②:压缩后 count / 文本化 <invoke> / 工具失败)。
+    必须同时满足:
+      ① 以 summary(user) 开头——_validate_tool_pairs 遇到边界孤儿 tool_result 会「从头前切」,
+         可能把注入的 summary 前缀一起丢掉;摘要不在首条即前缀已被切,结构不可信。
+      ② 以 user 结尾——否则上游把末尾 assistant 当 prefill,模型续写而非新开一轮,
+         原生 tool_use 通道不可用 → 工具调用退化成纯文本、开头漏出接续残片(用户看到的 count)。
+    任一不满足即返回 False,调用方应放弃注入、原样透传本发(交给 proactive/emergency 兜底)。"""
+    if not merged or len(merged) < 2:
+        return False
+    if merged[0].get("role") != "user" or merged[-1].get("role") != "user":
+        return False
+    c0 = merged[0].get("content", "")
+    return isinstance(c0, str) and SUMMARY_MARKER in c0
+
+
 def _mark_cache_breakpoint(msg: dict) -> bool:
     """在单条消息末尾打一个 ephemeral cache_control 断点,作为增量缓存锚点。返回是否打上。
 
@@ -1507,38 +1523,51 @@ class ProxyHandler(BaseHTTPRequestHandler):
             merged = match["prefix"] + new_messages
             merged = _validate_tool_pairs(merged)
 
-            # 注入后重建缓存断点,而非留下「零断点」。
-            # 原逻辑删光 merged 里所有 cache_control,导致整个 messages 无断点 → 上游不缓存,
-            # 每个注入轮按全新输入计费(只剩 system+tools 命中)。改为:先删净旧断点(避免位置失效 /
-            # 超过 4 个上限),再在两个稳定边界各打一个 ephemeral:
-            #   1) 摘要前缀末尾(ack,merged[1]):promote 后不变 → 缓存 system+tools+summary+ack 这一大段
-            #   2) 末条消息(merged[-1]):近端尾巴在 5min 窗口内跨轮 cache_read
-            # 断点总数 = system + tools + 2 ≤ 4,不触发上游 400。
-            _remark_cache_breakpoints(merged)
-
-            merged_chars = compressor._count_chars(merged)
-            if merged_chars < msg_chars:
-                log.info(
-                    f"[MSG] Injecting: {msg_chars:,} -> {merged_chars:,} chars "
-                    f"({len(messages)} -> {len(merged)} messages, "
-                    f"replaced 0-{match_end} with {len(match['prefix'])} prefix "
-                    f"+ {len(new_messages)} new)"
-                )
-                payload["messages"] = merged
-                msg_chars = merged_chars
-                injected = True
-                # 该压缩条目第一次被注入 → 标记为「压缩生效的第一个请求」,并带上压缩前规模。
-                if not match.get("used"):
-                    match["used"] = True
-                    first_compressed = True
-                    pre_compress_tokens = match.get("pre_tokens", 0)
-            else:
-                log.info(
-                    f"[MSG] Compression no longer helps: "
-                    f"merged={merged_chars:,} >= current={msg_chars:,} chars, removing"
+            if not _injection_is_safe(merged):
+                # 问题②止血:注入产物结构畸形(summary 前缀被 _validate_tool_pairs 从头切掉 /
+                # 末尾非 user 会被上游当 prefill)→ 放弃注入,原样透传本发(injected 保持 False),
+                # 交给下面的 proactive/emergency 兜底在需要时压。移除这条会产畸形的条目,
+                # 让后台在 end_turn 干净边界重建。
+                log.warning(
+                    "[MSG] Injection produced malformed structure "
+                    "(head/tail role or missing summary marker); "
+                    "dropping entry, passing through original"
                 )
                 store.remove(match)
                 match = None
+            else:
+                # 注入后重建缓存断点,而非留下「零断点」。
+                # 原逻辑删光 merged 里所有 cache_control,导致整个 messages 无断点 → 上游不缓存,
+                # 每个注入轮按全新输入计费(只剩 system+tools 命中)。改为:先删净旧断点(避免位置失效 /
+                # 超过 4 个上限),再在两个稳定边界各打一个 ephemeral:
+                #   1) 摘要前缀末尾(ack,merged[1]):promote 后不变 → 缓存 system+tools+summary+ack 这一大段
+                #   2) 末条消息(merged[-1]):近端尾巴在 5min 窗口内跨轮 cache_read
+                # 断点总数 = system + tools + 2 ≤ 4,不触发上游 400。
+                _remark_cache_breakpoints(merged)
+
+                merged_chars = compressor._count_chars(merged)
+                if merged_chars < msg_chars:
+                    log.info(
+                        f"[MSG] Injecting: {msg_chars:,} -> {merged_chars:,} chars "
+                        f"({len(messages)} -> {len(merged)} messages, "
+                        f"replaced 0-{match_end} with {len(match['prefix'])} prefix "
+                        f"+ {len(new_messages)} new)"
+                    )
+                    payload["messages"] = merged
+                    msg_chars = merged_chars
+                    injected = True
+                    # 该压缩条目第一次被注入 → 标记为「压缩生效的第一个请求」,并带上压缩前规模。
+                    if not match.get("used"):
+                        match["used"] = True
+                        first_compressed = True
+                        pre_compress_tokens = match.get("pre_tokens", 0)
+                else:
+                    log.info(
+                        f"[MSG] Compression no longer helps: "
+                        f"merged={merged_chars:,} >= current={msg_chars:,} chars, removing"
+                    )
+                    store.remove(match)
+                    match = None
 
         # Save current state for post-response compression trigger
         current_messages = payload.get("messages", messages)
@@ -1711,6 +1740,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 统一解析 usage:输入(新增/缓存读/缓存创建)与输出 token。
             # input 主要来自 message_start;output 取各 message_delta 的累计最大值。
             usage_info = {"input": 0, "cache_read": 0, "cache_create": 0, "output": 0}
+            # 本轮上游收尾原因(问题②根治):end_turn=一轮真正结束(干净边界,可安全建压缩条目);
+            # tool_use=模型还要继续调工具、正处于 tool 循环中(此时压缩会切坏工具对,不建条目)。
+            stop_reason = None
             if is_streaming and buffer:
                 try:
                     text = buffer.decode("utf-8", errors="replace")
@@ -1743,6 +1775,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 usage_info["output"] = max(usage_info["output"], int(u.get("output_tokens", 0)))
                             if u.get("input_tokens") and not usage_info["input"]:
                                 usage_info["input"] = int(u.get("input_tokens", 0))
+                            # stop_reason 在 message_delta.delta.stop_reason
+                            sr = data.get("delta", {}).get("stop_reason")
+                            if sr:
+                                stop_reason = sr
                 except Exception as e:
                     log.warning(f"[MSG] Failed to parse SSE for usage: {e}")
             elif not is_streaming and buffer:
@@ -1753,6 +1789,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     usage_info["cache_read"] = u.get("cache_read_input_tokens", 0)
                     usage_info["cache_create"] = u.get("cache_creation_input_tokens", 0)
                     usage_info["output"] = u.get("output_tokens", 0)
+                    stop_reason = data.get("stop_reason")
                 except Exception as e:
                     log.warning(f"[MSG] Failed to parse response for usage: {e}")
 
@@ -1816,7 +1853,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 有效 trigger 夹到真实窗口×安全余量之下:trigger 配超真实窗口时(如为 1M 调高但实际 200k),
             # 仍能在撞墙前主动压,而非永不触发、退化到 400 emergency 兜底。
             eff_trigger = _effective_trigger(req_headers)
-            if total_input > 0 and total_input > eff_trigger:
+            if total_input > 0 and total_input > eff_trigger and stop_reason != "end_turn":
+                # 问题②根治:后台建压缩条目只在「一轮真正结束」(stop_reason==end_turn)时进行——此刻对话
+                # 处于干净 user 边界,_select_cut 能切在干净点、保留段不含孤儿 tool_result。tool 循环中
+                # (tool_use / max_tokens 等)一律不建条目,避免切坏工具对;真涨大撞墙由转发前 proactive
+                # 与 400 后 emergency 兜底同步压(那两条不受此限)。
+                log.info(
+                    f"[MSG] {total_input:,} tokens > trigger {eff_trigger:,} but "
+                    f"stop_reason={stop_reason!r} (not end_turn) — mid tool-loop, deferring compression"
+                )
+            elif total_input > 0 and total_input > eff_trigger:
                 # 去重 + 登记意图原子完成:claim_compression 在一把锁内查是否已被覆盖,没有才建条目、
                 # 登记 intent_hashes 并返回它;已覆盖则返回 None。in_flight_only 按「本发是否注入了压缩」
                 # 决定去重口径(见 claim_compression docstring):
