@@ -1348,6 +1348,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except ValueError:
                 hours = 24.0
         extra = {
+            "version": VERSION,
             "upstream_url": UPSTREAM_URL,
             "summarizer_model": SUMMARIZER_MODEL,
             "trigger_tokens": TRIGGER_TOKENS,

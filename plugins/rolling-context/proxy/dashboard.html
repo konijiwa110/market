@@ -707,7 +707,7 @@ async function load(){
     if (d.error){ document.getElementById('config').textContent = '错误:'+d.error; return; }
     const cfg = d.config || {};
     document.getElementById('config').textContent =
-      `上游 ${cfg.upstream_url||'?'} · 端口 ${cfg.listen_port||'?'} · 触发 ${fmt(cfg.trigger_tokens)} → 保留 ${fmt(cfg.target_tokens)} · 摘要器 ${cfg.summarizer_model||'?'}`;
+      `版本 ${cfg.version||'?'} · 上游 ${cfg.upstream_url||'?'} · 端口 ${cfg.listen_port||'?'} · 触发 ${fmt(cfg.trigger_tokens)} → 保留 ${fmt(cfg.target_tokens)} · 摘要器 ${cfg.summarizer_model||'?'}`;
     document.getElementById('updated').textContent =
       '更新于 ' + new Date(d.generated_at*1000).toLocaleString() +
       ' · 窗口 ' + (d.window_hours===null?'全部':d.window_hours+'h') +
