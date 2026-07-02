@@ -1026,6 +1026,30 @@ def _estimate_body_tokens(raw_body_len: int) -> int:
     return raw_body_len // 4
 
 
+def _image_excess_bytes(messages: list) -> int:
+    """图片 base64 超出「单图 token 上限」的字节当量合计,用于修正 body 字节粗估。
+    一张截图的 base64 可达数百 KB,按 ÷4 口径会虚增十几万 token(真实单图 ≤~1600 token),
+    曾把带图透传请求的估算虚高近 3 倍、未到 trigger 也被误判超限反复 proactive(压缩风暴的放大器)。
+    单图 token 与 compressor._image_chars 同口径:min(1600, max(1, b64//1000))。"""
+    excess = 0
+    for m in messages:
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            subs = [b] if b.get("type") == "image" else (
+                b.get("content") if b.get("type") == "tool_result"
+                and isinstance(b.get("content"), list) else [])
+            for s in subs:
+                if isinstance(s, dict) and s.get("type") == "image":
+                    b64 = (s.get("source") or {}).get("data", "")
+                    tokens = min(1600, max(1, len(b64) // 1000))
+                    excess += max(0, len(b64) - tokens * 4)
+    return excess
+
+
 def _should_proactive_compress(raw_body_len: int, req_headers: dict, is_count: bool, injected: bool) -> bool:
     """是否在转发前主动同步压缩:开关开 + 非 count 探测 + 未命中缓存(否则已是小请求) + 粗估超有效 trigger。"""
     if not PROACTIVE_COMPRESS or is_count or injected:
@@ -1056,12 +1080,15 @@ def _injection_is_safe(merged: list) -> bool:
     必须同时满足:
       ① 以 summary(user) 开头——_validate_tool_pairs 遇到边界孤儿 tool_result 会「从头前切」,
          可能把注入的 summary 前缀一起丢掉;摘要不在首条即前缀已被切,结构不可信。
-      ② 以 user 结尾——否则上游把末尾 assistant 当 prefill,模型续写而非新开一轮,
+      ② 末尾不是 assistant——末尾 assistant 会被上游当 prefill,模型续写而非新开一轮,
          原生 tool_use 通道不可用 → 工具调用退化成纯文本、开头漏出接续残片(用户看到的 count)。
+         注意只拒 assistant:CC 会把任务提醒/IDE 诊断等附件作为独立的 role:"system" 消息挂在
+         messages 末尾,这类请求完全合法(1.20.0 曾把尾部写死成 ==user,把它们全误判为畸形,
+         配合误删条目造成「压缩风暴」)。
     任一不满足即返回 False,调用方应放弃注入、原样透传本发(交给 proactive/emergency 兜底)。"""
     if not merged or len(merged) < 2:
         return False
-    if merged[0].get("role") != "user" or merged[-1].get("role") != "user":
+    if merged[0].get("role") != "user" or merged[-1].get("role") == "assistant":
         return False
     c0 = merged[0].get("content", "")
     return isinstance(c0, str) and SUMMARY_MARKER in c0
@@ -1524,16 +1551,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             merged = _validate_tool_pairs(merged)
 
             if not _injection_is_safe(merged):
-                # 问题②止血:注入产物结构畸形(summary 前缀被 _validate_tool_pairs 从头切掉 /
-                # 末尾非 user 会被上游当 prefill)→ 放弃注入,原样透传本发(injected 保持 False),
-                # 交给下面的 proactive/emergency 兜底在需要时压。移除这条会产畸形的条目,
-                # 让后台在 end_turn 干净边界重建。
+                # 真畸形(summary 前缀被前切 / 末尾 assistant 会被上游当 prefill)才走到这:
+                # 放弃本发注入、原样透传(injected 保持 False),交给 proactive/emergency 兜底。
+                # 条目本身保留——它经内容哈希自校验,对其他结构正常的请求可能完全健康;
+                # 1.20.0 曾在此 store.remove 误删健康条目,是「压缩风暴」的引擎。
                 log.warning(
-                    "[MSG] Injection produced malformed structure "
-                    "(head/tail role or missing summary marker); "
-                    "dropping entry, passing through original"
+                    "[MSG] Injection structurally unsafe for this request "
+                    f"(head={merged[0].get('role') if merged else None} "
+                    f"tail={merged[-1].get('role') if merged else None} n={len(merged) if merged else 0}); "
+                    "skipping injection, passing through original"
                 )
-                store.remove(match)
                 match = None
             else:
                 # 注入后重建缓存断点,而非留下「零断点」。
@@ -1578,10 +1605,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 压后第一发即缩到 target 上下,且压缩条目当场登记进 store,后续请求直接命中、不再付这次同步延迟。
         prewarm = False
         proactive_entry = None
-        if _should_proactive_compress(len(raw_body), req_headers, is_count, injected):
-            est_tokens = _estimate_body_tokens(len(raw_body))
+        # 估算前先扣图片超额字节:base64 图按 ÷4 会虚增十几万 token/张,带图透传请求会被误判超 trigger。
+        body_est_len = max(0, len(raw_body) - _image_excess_bytes(current_messages))
+        if _should_proactive_compress(body_est_len, req_headers, is_count, injected):
+            est_tokens = _estimate_body_tokens(body_est_len)
             log.info(
-                f"[MSG] Proactive compress: ~{est_tokens:,} est tokens (body {len(raw_body):,} B) "
+                f"[MSG] Proactive compress: ~{est_tokens:,} est tokens "
+                f"(body {len(raw_body):,} B, est-adjusted {body_est_len:,} B) "
                 f"> trigger {_effective_trigger(req_headers):,}, no cache hit — compressing before forward"
             )
             new_msgs = None

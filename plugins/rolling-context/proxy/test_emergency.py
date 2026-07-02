@@ -735,6 +735,28 @@ class ProactiveGate(unittest.TestCase):
         self.assertFalse(server._should_proactive_compress(1_000_000, h, False, False))  # //4=250000
         self.assertTrue(server._should_proactive_compress(1_400_001, h, False, False))   # //4=350000
 
+    def test_image_excess_bytes_deducts_base64_over_cap(self):
+        # 600KB 图片 base64 → 真实 ~600 tok(b64//1000),超额 = 600000 - 600*4 = 597600
+        b64 = "A" * 600_000
+        msgs = [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+        ]}]
+        self.assertEqual(server._image_excess_bytes(msgs), 600_000 - 600 * 4)
+
+    def test_image_excess_bytes_sees_nested_tool_result_images(self):
+        b64 = "B" * 2_000_000  # 超大图,token 封顶 1600 → 超额 = 2000000 - 6400
+        msgs = [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+            ]},
+        ]}]
+        self.assertEqual(server._image_excess_bytes(msgs), 2_000_000 - 6_400)
+
+    def test_image_excess_bytes_zero_without_images(self):
+        msgs = [{"role": "user", "content": "plain text"},
+                {"role": "user", "content": [{"type": "text", "text": "block"}]}]
+        self.assertEqual(server._image_excess_bytes(msgs), 0)
+
 
 # --- fake upstream for the proactive end-to-end test ---------------------------------------
 

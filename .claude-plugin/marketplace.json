@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "rolling-context",
-      "version": "1.20.0",
+      "version": "1.20.1",
       "description": "Rolling context compression with third-party baseURL support + a built-in token/latency statistics dashboard at /stats. Old messages get summarized, recent messages stay verbatim. Config-first, env-fallback for upstream and apikey.",
       "source": "./plugins/rolling-context",
       "category": "productivity"

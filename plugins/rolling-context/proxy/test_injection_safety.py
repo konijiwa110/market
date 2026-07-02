@@ -75,6 +75,18 @@ class InjectionIsSafe(unittest.TestCase):
         ]
         self.assertFalse(server._injection_is_safe(merged))
 
+    def test_system_tail_is_safe(self):
+        # CC appends task reminders / IDE diagnostics as a trailing role:"system" message.
+        # 1.20.0's `tail == user` check misjudged these as malformed and (with the entry
+        # removal) caused the compression storm — only an assistant tail is a prefill risk.
+        merged = [
+            _summary_msg(),
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "ok"}]},
+            {"role": "system", "content": "The task tools haven't been used recently..."},
+        ]
+        self.assertTrue(server._injection_is_safe(merged))
+
     def test_non_string_summary_content_is_unsafe(self):
         # Block-list content at head can't carry the marker check reliably → reject.
         merged = [

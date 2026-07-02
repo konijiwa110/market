@@ -1,5 +1,31 @@
 # ChangeLog
 
+## 1.20.1 — 修复「压缩风暴」:注入自检误判 system 尾巴 + 误删健康条目 + 图片虚高估算
+
+### 背景
+1.20.0 为治问题②(压缩后 count/工具调用失败)加了注入产物自检 `_injection_is_safe`,但尾部条件写死成
+`role == "user"`。实测(请求归档 + transcript 逐发对照)发现:CC 会把任务提醒、IDE 诊断等附件作为**独立的
+`role:"system"` 消息**挂在 messages 末尾——这类请求完全合法,却被自检误判为畸形。三个缺陷咬合成自我喂养
+的循环:①自检误判 → ② malformed 分支 `store.remove` 把上一秒还在正常服务的**健康条目误删** → 本发透传
+全量 → ③ `_estimate_body_tokens = body//4` **不扣图片 base64**(一张截图 ~600KB ≈ 虚增 15 万 token),
+未到 trigger 的请求被误判超限 → proactive 当场压缩建新条目 → 下一条 system 提醒到来再走一遍。表现为
+「一直在压缩」「没到 180k 也压」。
+
+### 变更(仅 `proxy/server.py` + 单测)
+- **`_injection_is_safe` 尾部条件放宽**:`!= "user"` 改为 `== "assistant"` 才拒——只有末尾 assistant 会被
+  上游当 prefill 续写(count 的真正来源);user/system 尾巴均合法,带附件的请求恢复正常注入。
+- **malformed 分支不再 `store.remove`**:条目经内容哈希自校验,对其他请求可能完全健康,只跳过本发注入;
+  日志补打 head/tail 角色与消息数,再遇真畸形可直接定位。
+- **新增 `_image_excess_bytes`**:proactive 触发估算前扣除图片 base64 超出单图 token 上限的字节当量
+  (与 `compressor._image_chars` 同口径:单图 `min(1600, max(1, b64//1000))` token),带图会话不再虚高
+  近 3 倍;keep_ratio 同步用修正后的估算,不再过切。
+- 单测:`test_injection_safety` 补「system 尾巴安全」;`test_emergency` 补 `_image_excess_bytes` 三例
+  (顶层图 / tool_result 嵌套图 / 无图归零)。
+
+### 取舍
+1.20.0 的 A(自检)方向保留、只放宽一档;B(end_turn gating)不动。真畸形(assistant 尾巴/前缀被切)仍会
+拒注入并透传,由 proactive/emergency 兜底——修掉③后,透传不再被图片字节误触发,风暴闭环断在三处。
+
 ## 1.19.0 — 升级替换「排空再杀」:不再切断旧会话的在途流式请求
 
 ### 背景
