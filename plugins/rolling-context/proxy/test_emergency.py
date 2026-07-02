@@ -49,6 +49,23 @@ class LooksTooLong(unittest.TestCase):
         self.assertFalse(server._looks_too_long(b"\xff\xfe\x00bad"))
 
 
+class HardCeiling(unittest.TestCase):
+    """饥饿逃生阀硬顶:trigger×1.2 与窗口×95% 取小(1.20.2)。"""
+
+    def test_1m_window_uses_trigger_margin(self):
+        # 1M 窗口:180k×1.2=216k < 950k → 硬顶 216k
+        self.assertEqual(server._hard_ceiling(180_000, 1_000_000), 216_000)
+
+    def test_200k_window_capped_below_wall(self):
+        # 200k 窗口:216k 越窗,夹回 190k(95%),保证先于撞墙触发
+        self.assertEqual(server._hard_ceiling(180_000, 200_000), 190_000)
+
+    def test_ceiling_always_above_trigger(self):
+        # 硬顶必须严格高于 trigger,否则闸门形同虚设
+        for trig, win in ((160_000, 200_000), (180_000, 1_000_000), (40_000, 200_000)):
+            self.assertGreater(server._hard_ceiling(trig, win), trig)
+
+
 class ParseReportedTokens(unittest.TestCase):
     def test_extracts_first_big_number_before_tokens(self):
         body = b"prompt is too long: 2100398 tokens > 1000000 maximum"

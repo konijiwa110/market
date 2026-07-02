@@ -1,5 +1,30 @@
 # ChangeLog
 
+## 1.20.2 — 饥饿逃生阀:超长工具循环中硬顶强制压缩 + 摘要尾块合并
+
+### 背景
+1.20.0 的 end_turn 闸门(后台建条目只在回合结束时进行)在超长 agentic 工具循环下暴露反面代价——
+**压缩饥饿**:实测一个会话连续数小时不出 `end_turn`,条目停留在第 509 条消息不再重建,token 从 180k
+无界涨到 **323k**(15 连发全部 `deferring compression`),最终被 CC 自身 compact 抢先兜底(比代理摘要
+粗暴、丢细节多),代理刚建好的新条目因前缀被 CC 改写永不命中,白跑一趟。
+
+另一处小毛病:摘要分块按 250,000 字符预算贪心切,258,223 字符刚好压线超 3% → 拆成 250k + 8k 两块、
+串行两次 haiku 调用(面板上显示为同一会话"连续压缩 2 次",第二次仅 5.6k token),多等 34 秒。
+
+### 修复
+1. **饥饿逃生阀**(`server.py` 新增 `_hard_ceiling`):`min(trigger×1.2, 窗口×95%)` 为硬顶——
+   1M 窗口 = 216k,200k 窗口夹回 190k(先于撞墙)。循环中 token 超硬顶时不再等 end_turn,强制建
+   条目;切点走 `_select_cut` 既有 toolpair 模式,与 proactive/emergency 同一套逻辑,工具对完整。
+   未超硬顶维持原闸门行为,正常短循环(涨十几 k 自然 end_turn)不受影响。
+2. **摘要尾块合并**(`compressor.py` `_chunk_by_chars`):尾块 < 预算 15% 时并入前一块,预算本是
+   防超摘要器窗口的软性粗界,超 15% 一次过比多跑一次串行摘要调用划算。
+
+### 验证
+- 新增 `test_emergency.HardCeiling`(3 用例:1M 取 trigger 缓冲、200k 夹回 95%、硬顶恒大于 trigger)
+  与 `test_compressor.ChunkTailMerge`(3 用例:小尾并入、正常尾不动、单块不动),91 个测试全绿。
+- 运行观察:超长循环中日志应出现 `mid tool-loop starvation, compressing anyway (toolpair cut)`
+  且 token 不再越过硬顶持续上涨;压缩临界尺寸(250k~287k 字符)不再拆出微型第二块。
+
 ## 1.20.1 — 修复「压缩风暴」:注入自检误判 system 尾巴 + 误删健康条目 + 图片虚高估算
 
 ### 背景

@@ -371,18 +371,24 @@ class RollingCompressor:
 
     def _chunk_by_chars(self, messages: list, char_budget: int) -> list:
         """把消息按时间序贪心切成多块,每块 _messages_to_text 长度 ≤ char_budget。
-        单条消息在 _messages_to_text 里已截到 ~4KB,不会单独超预算,故贪心累加即可。"""
-        chunks = []
+        单条消息在 _messages_to_text 里已截到 ~4KB,不会单独超预算,故贪心累加即可。
+        尾块 < 预算 15% 时并入前一块:预算是软性的(防超摘要器窗口的粗界),超 15% 一次过
+        比为几 KB 尾巴多跑一次串行摘要调用划算(实测 258KB/250KB 拆两块,第二块仅 8KB)。"""
+        chunks, sizes = [], []
         cur, cur_chars = [], 0
         for m in messages:
             mc = len(self._messages_to_text([m]))
             if cur and cur_chars + mc > char_budget:
                 chunks.append(cur)
+                sizes.append(cur_chars)
                 cur, cur_chars = [], 0
             cur.append(m)
             cur_chars += mc
         if cur:
             chunks.append(cur)
+            sizes.append(cur_chars)
+        if len(chunks) >= 2 and sizes[-1] < char_budget * 0.15:
+            chunks[-2].extend(chunks.pop())
         return chunks
 
     def _summarize_chunk(self, conversation_text: str, existing_summary: str, auth_headers: dict) -> str:

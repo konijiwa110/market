@@ -113,5 +113,36 @@ class StripUnsupported1mBeta(unittest.TestCase):
         self.assertNotIn("anthropic-beta", {k.lower(): v for k, v in captured.items()})
 
 
+class ChunkTailMerge(unittest.TestCase):
+    """_chunk_by_chars 尾块合并:尾块 < 预算 15% 时并入前一块,省一次串行摘要调用(1.20.2)。
+    单条消息文本 = "**user**: " + content(10 字符前缀),content 长度按目标尺寸减 10 构造。"""
+
+    @staticmethod
+    def _msg(text_len):
+        return {"role": "user", "content": "x" * (text_len - 10)}
+
+    def setUp(self):
+        self.c = compressor.RollingCompressor()
+
+    def test_tiny_tail_merged_into_previous(self):
+        # 900/950/100,预算 1000 → 贪心切 3 块,尾块 100 < 150(15%)→ 并入前块
+        msgs = [self._msg(900), self._msg(950), self._msg(100)]
+        chunks = self.c._chunk_by_chars(msgs, 1000)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks[1]), 2)  # 950 + 100 两条同块
+
+    def test_normal_tail_not_merged(self):
+        # 尾块 200 ≥ 150 → 保持 3 块不动
+        msgs = [self._msg(900), self._msg(950), self._msg(200)]
+        chunks = self.c._chunk_by_chars(msgs, 1000)
+        self.assertEqual(len(chunks), 3)
+
+    def test_single_chunk_untouched(self):
+        msgs = [self._msg(100), self._msg(100)]
+        chunks = self.c._chunk_by_chars(msgs, 1000)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(len(chunks[0]), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

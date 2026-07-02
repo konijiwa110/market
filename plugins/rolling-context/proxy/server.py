@@ -1020,6 +1020,13 @@ def _effective_trigger(req_headers: dict) -> int:
     return min(TRIGGER_TOKENS, int(_request_window(req_headers) * TRIGGER_SAFETY))
 
 
+def _hard_ceiling(eff_trigger: int, window: int) -> int:
+    """饥饿逃生阀硬顶:超长工具循环中 token 超过该值时,不再等 end_turn、循环中强制建条目。
+    trigger×1.2 给正常短循环留缓冲(实测单循环可涨 15k+ 后自然 end_turn);窗口×95% 封顶,
+    保证 200k 窗口下先于撞墙触发(180k×1.2=216k 会越过 200k 窗口,夹回 190k)。"""
+    return min(int(eff_trigger * 1.2), int(window * 0.95))
+
+
 def _estimate_body_tokens(raw_body_len: int) -> int:
     """从原始请求体字节数粗估 token。整体口径(含 system+tools+messages),与 breakdown 日志同除数 4。
     偏低估(JSON 结构使字节/token 高于纯文本),故据此判「超 trigger」是保守的:只在请求确实很大时才触发。"""
@@ -1883,16 +1890,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 有效 trigger 夹到真实窗口×安全余量之下:trigger 配超真实窗口时(如为 1M 调高但实际 200k),
             # 仍能在撞墙前主动压,而非永不触发、退化到 400 emergency 兜底。
             eff_trigger = _effective_trigger(req_headers)
-            if total_input > 0 and total_input > eff_trigger and stop_reason != "end_turn":
+            # 饥饿逃生阀:end_turn 闸门优先(干净边界),但超长工具循环可能几小时不出 end_turn,
+            # 条目一直不重建、token 无界上涨(实测涨到 323k,最终被 CC 自身 compact 抢先兜底、丢细节)。
+            # 超过硬顶(trigger×1.2,且不越窗口 95%)时循环中也强制建条目——_select_cut 的 toolpair
+            # 模式保证切点工具对完整,与 proactive/emergency 循环中压缩走的是同一套切点逻辑。
+            hard_ceiling = _hard_ceiling(eff_trigger, _request_window(req_headers))
+            if (
+                total_input > 0 and total_input > eff_trigger
+                and stop_reason != "end_turn" and total_input <= hard_ceiling
+            ):
                 # 问题②根治:后台建压缩条目只在「一轮真正结束」(stop_reason==end_turn)时进行——此刻对话
                 # 处于干净 user 边界,_select_cut 能切在干净点、保留段不含孤儿 tool_result。tool 循环中
                 # (tool_use / max_tokens 等)一律不建条目,避免切坏工具对;真涨大撞墙由转发前 proactive
                 # 与 400 后 emergency 兜底同步压(那两条不受此限)。
                 log.info(
                     f"[MSG] {total_input:,} tokens > trigger {eff_trigger:,} but "
-                    f"stop_reason={stop_reason!r} (not end_turn) — mid tool-loop, deferring compression"
+                    f"stop_reason={stop_reason!r} (not end_turn) — mid tool-loop, deferring "
+                    f"compression (hard ceiling {hard_ceiling:,})"
                 )
             elif total_input > 0 and total_input > eff_trigger:
+                if stop_reason != "end_turn":
+                    log.info(
+                        f"[MSG] {total_input:,} tokens > hard ceiling {hard_ceiling:,} — "
+                        f"mid tool-loop starvation, compressing anyway (toolpair cut)"
+                    )
                 # 去重 + 登记意图原子完成:claim_compression 在一把锁内查是否已被覆盖,没有才建条目、
                 # 登记 intent_hashes 并返回它;已覆盖则返回 None。in_flight_only 按「本发是否注入了压缩」
                 # 决定去重口径(见 claim_compression docstring):
