@@ -1055,5 +1055,46 @@ class DisguiseClient(unittest.TestCase):
         self.assertEqual(out["authorization"], "Bearer CUR")
 
 
+class HashResumeImmunity(unittest.TestCase):
+    """哈希必须对 CC resume 时的消息改写免疫,否则恢复会话后深条目全部失配(480k 裸奔实案)。"""
+
+    def test_thinking_block_stripped_from_hash(self):
+        # 会话进行中:assistant 消息带 thinking+signature;resume 后 CC 剥掉 thinking 块
+        live = {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "我先确认能否连上 lisa 主机", "signature": "CAISxQsKYgg"},
+            {"type": "text", "text": "我先确认能否连上 lisa 主机,再找日志位置。"},
+            {"type": "tool_use", "id": "toolu_019cu", "name": "Bash", "input": {"command": "ssh lisa true"}},
+        ]}
+        resumed = {"role": "assistant", "content": [b for b in live["content"] if b["type"] != "thinking"]}
+        self.assertEqual(server._hash_message(live), server._hash_message(resumed))
+
+    def test_redacted_thinking_stripped_from_hash(self):
+        live = {"role": "assistant", "content": [
+            {"type": "redacted_thinking", "data": "opaque-bytes"},
+            {"type": "text", "text": "answer"},
+        ]}
+        resumed = {"role": "assistant", "content": [{"type": "text", "text": "answer"}]}
+        self.assertEqual(server._hash_message(live), server._hash_message(resumed))
+
+    def test_system_reminder_stripped_from_hash(self):
+        # 回归:确认 _VOLATILE_TAGS_RE 真的在剥 reminder(reminder 会在请求间被 CC 挪动/移除)
+        with_reminder = {"role": "user", "content": [
+            {"type": "text", "text": "本地部署了吗\n<system-reminder>The user sent a new message.</system-reminder>"},
+        ]}
+        without = {"role": "user", "content": [{"type": "text", "text": "本地部署了吗\n"}]}
+        self.assertEqual(server._hash_message(with_reminder), server._hash_message(without))
+
+    def test_real_content_change_still_detected(self):
+        # 免疫不能过度:正文/工具输入变了必须失配
+        a = {"role": "assistant", "content": [{"type": "text", "text": "部署完成"}]}
+        b = {"role": "assistant", "content": [{"type": "text", "text": "部署失败"}]}
+        self.assertNotEqual(server._hash_message(a), server._hash_message(b))
+        c = {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}
+        d = {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "rm"}}]}
+        self.assertNotEqual(server._hash_message(c), server._hash_message(d))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

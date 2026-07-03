@@ -1,5 +1,31 @@
 # ChangeLog
 
+## 1.20.3 — 哈希对 resume 免疫:剥离 thinking 块,恢复会话后深条目不再全灭
+
+### 背景
+实测(max,fa861c68):会话进行中深条目正常命中,billed 稳定 113k;次日 resume 后同一会话
+第一发直接 480k 裸奔——深条目(221 条哈希链)中 **61 条 assistant 消息哈希全部失配**。
+字节级 diff 定位根因:**CC 在 resume 时会剥掉历史 assistant 消息里的 thinking/redacted_thinking
+块**(同一 tool_use id 的消息,会话中 2,489B 带 `signature`,resume 后 454B 无 thinking),
+而 `_hash_message` 把 thinking 块算进了哈希 → 任何带 thinking 的会话一 resume 深条目必死,
+之后是全套连锁:浅条目兜底 → 480k 出门 → 硬顶逃生阀重压一次 → 过渡期两发全尺寸计费
+(含一次 433.6k 缓存重建,叠加 CC 插话强制文字重发的前缀分叉,单次损失 40 万+ cache-write)。
+
+### 修复
+- **`_normalize_content` 丢弃 `thinking`/`redacted_thinking` 块后再哈希**(server.py)。
+  thinking 是易失内容,消息身份由 text/tool_use 承载;剥离后 resume 前后哈希一致,深条目
+  照常命中,480k 场景从源头消失。reminder 剥离(`_VOLATILE_TAGS_RE`)经排查工作正常,未改动。
+
+### 迁移成本
+哈希算法变更 → 已落盘旧条目升级后一次性失配(内容自校验,失配即不用,不会注错),各活跃
+会话首次超 trigger 时重压一次即恢复,无需手工清理 store。
+
+### 验证
+- 新增 `test_emergency.HashResumeImmunity`(4 用例:thinking 剥离等价、redacted_thinking 等价、
+  reminder 剥离回归、正文/工具输入变更仍必失配),95 个测试全绿。
+- 运行观察:resume 一个带 thinking 的长会话,首发应照常注入深条目(billed 维持压缩后水平),
+  不再出现"恢复会话后第一发全尺寸 + 硬顶强压"的过渡。
+
 ## 1.20.2 — 饥饿逃生阀:超长工具循环中硬顶强制压缩 + 摘要尾块合并
 
 ### 背景

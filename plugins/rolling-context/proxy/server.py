@@ -287,6 +287,8 @@ def _normalize_content(content):
         result = []
         for block in content:
             if isinstance(block, dict):
+                if block.get("type") in ("thinking", "redacted_thinking"):
+                    continue  # CC resume 时会剥掉历史 thinking 块,哈希必须对其免疫,否则恢复会话后所有深条目失配
                 b = {}
                 for k, v in block.items():
                     if k == "cache_control":
