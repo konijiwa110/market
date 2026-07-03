@@ -1055,6 +1055,76 @@ class DisguiseClient(unittest.TestCase):
         self.assertEqual(out["authorization"], "Bearer CUR")
 
 
+class DecideCompression(unittest.TestCase):
+    """decide_compression 决策表穷举——两处判定点的唯一事实来源,新增条件必须先过这张矩阵。"""
+
+    # ---- stage="pre"(转发前,粗估口径) ----
+
+    def test_pre_disabled(self):
+        self.assertEqual(server.decide_compression("pre", est_tokens=999_999, eff_trigger=180_000,
+                                                   proactive_enabled=False), ("forward", "disabled"))
+
+    def test_pre_count_probe(self):
+        self.assertEqual(server.decide_compression("pre", est_tokens=999_999, eff_trigger=180_000,
+                                                   is_count=True), ("forward", "count-probe"))
+
+    def test_pre_cache_hit(self):
+        self.assertEqual(server.decide_compression("pre", est_tokens=999_999, eff_trigger=180_000,
+                                                   injected=True), ("forward", "cache-hit"))
+
+    def test_pre_over_trigger_syncs(self):
+        self.assertEqual(server.decide_compression("pre", est_tokens=180_001, eff_trigger=180_000),
+                         ("sync", "over-trigger"))
+
+    def test_pre_under_or_at_trigger_forwards(self):
+        self.assertEqual(server.decide_compression("pre", est_tokens=180_000, eff_trigger=180_000),
+                         ("forward", "under-trigger"))
+
+    # ---- stage="post"(响应后,上游真实 token 口径) ----
+
+    def test_post_no_usage_skips(self):
+        self.assertEqual(server.decide_compression("post", real_tokens=0, eff_trigger=180_000,
+                                                   hard_ceiling=216_000, stop_reason="end_turn"),
+                         ("skip", "no-usage"))
+
+    def test_post_under_trigger_skips(self):
+        self.assertEqual(server.decide_compression("post", real_tokens=180_000, eff_trigger=180_000,
+                                                   hard_ceiling=216_000, stop_reason="end_turn"),
+                         ("skip", "under-trigger"))
+
+    def test_post_end_turn_compresses(self):
+        self.assertEqual(server.decide_compression("post", real_tokens=180_001, eff_trigger=180_000,
+                                                   hard_ceiling=216_000, stop_reason="end_turn"),
+                         ("bg", "end-turn"))
+
+    def test_post_tool_loop_defers_under_ceiling(self):
+        # 问题②闸门:循环中超 trigger 但未超硬顶 → 推迟等干净切点
+        self.assertEqual(server.decide_compression("post", real_tokens=190_000, eff_trigger=180_000,
+                                                   hard_ceiling=216_000, stop_reason="tool_use"),
+                         ("defer", "tool-loop"))
+
+    def test_post_tool_loop_at_ceiling_still_defers(self):
+        self.assertEqual(server.decide_compression("post", real_tokens=216_000, eff_trigger=180_000,
+                                                   hard_ceiling=216_000, stop_reason="tool_use"),
+                         ("defer", "tool-loop"))
+
+    def test_post_starvation_over_ceiling_compresses(self):
+        # 饥饿逃生阀:循环中超硬顶 → 强制建条目(fa861c68 480k 实案路径)
+        self.assertEqual(server.decide_compression("post", real_tokens=480_737, eff_trigger=200_000,
+                                                   hard_ceiling=240_000, stop_reason="tool_use"),
+                         ("bg", "starvation"))
+
+    def test_post_max_tokens_treated_as_loop(self):
+        # stop_reason 非 end_turn 的其他值(max_tokens 等)与 tool_use 同款处理
+        self.assertEqual(server.decide_compression("post", real_tokens=190_000, eff_trigger=180_000,
+                                                   hard_ceiling=216_000, stop_reason="max_tokens"),
+                         ("defer", "tool-loop"))
+
+    def test_unknown_stage_raises(self):
+        with self.assertRaises(ValueError):
+            server.decide_compression("mid")
+
+
 class HashResumeImmunity(unittest.TestCase):
     """哈希必须对 CC resume 时的消息改写免疫,否则恢复会话后深条目全部失配(480k 裸奔实案)。"""
 

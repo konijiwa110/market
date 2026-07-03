@@ -1059,11 +1059,69 @@ def _image_excess_bytes(messages: list) -> int:
     return excess
 
 
+def decide_compression(
+    stage: str,
+    *,
+    est_tokens: int = 0,
+    real_tokens: int = 0,
+    eff_trigger: int = 0,
+    hard_ceiling: int = 0,
+    stop_reason=None,
+    injected: bool = False,
+    is_count: bool = False,
+    proactive_enabled: bool = True,
+):
+    """压缩决策表——两处判定点(转发前 / 响应后)的唯一事实来源。返回 (action, reason)。
+
+    历史教训:决策条件散在转发前后两处,每加一个条件(end_turn 闸门、硬顶、注入状态)都可能
+    和另一处打架,1.19.1 / 1.20.1 / 1.20.2 三次回归全是判定点互咬。收敛成纯函数后,全部路况
+    可以穷举单测,新增条件必须先过矩阵。
+
+    stage="pre"(转发前,基于图片修正后的粗估):
+        "sync"    — 同步压缩再转发(resume 冷启动大请求,先压后发)
+        "forward" — 原样转发
+    stage="post"(响应后,基于上游回报的真实 token):
+        "bg"      — 起后台压缩(干净 end_turn 边界,或超硬顶的饥饿逃生)
+        "defer"   — 循环中推迟(超 trigger 但未超硬顶,等 end_turn 干净切点)
+        "skip"    — 不动作(无用量数据 / 未超 trigger)
+
+    reason 是稳定的短码(单测断言用);人读日志仍在调用点按原格式打印。
+    纯函数、无副作用;去重(claim_compression 原子判定)与切点选择(_select_cut)不在此层。
+    """
+    if stage == "pre":
+        if not proactive_enabled:
+            return "forward", "disabled"
+        if is_count:
+            return "forward", "count-probe"
+        if injected:
+            return "forward", "cache-hit"
+        if est_tokens > eff_trigger:
+            return "sync", "over-trigger"
+        return "forward", "under-trigger"
+    if stage == "post":
+        if real_tokens <= 0:
+            return "skip", "no-usage"
+        if real_tokens <= eff_trigger:
+            return "skip", "under-trigger"
+        if stop_reason == "end_turn":
+            return "bg", "end-turn"
+        if real_tokens > hard_ceiling:
+            return "bg", "starvation"
+        return "defer", "tool-loop"
+    raise ValueError(f"unknown stage: {stage!r}")
+
+
 def _should_proactive_compress(raw_body_len: int, req_headers: dict, is_count: bool, injected: bool) -> bool:
-    """是否在转发前主动同步压缩:开关开 + 非 count 探测 + 未命中缓存(否则已是小请求) + 粗估超有效 trigger。"""
-    if not PROACTIVE_COMPRESS or is_count or injected:
-        return False
-    return _estimate_body_tokens(raw_body_len) > _effective_trigger(req_headers)
+    """转发前判定的组装层:算粗估与有效 trigger,决策本体走 decide_compression 决策表。"""
+    action, _ = decide_compression(
+        "pre",
+        est_tokens=_estimate_body_tokens(raw_body_len),
+        eff_trigger=_effective_trigger(req_headers),
+        injected=injected,
+        is_count=is_count,
+        proactive_enabled=PROACTIVE_COMPRESS,
+    )
+    return action == "sync"
 
 
 def _validate_tool_pairs(messages: list) -> list:
@@ -1897,21 +1955,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 超过硬顶(trigger×1.2,且不越窗口 95%)时循环中也强制建条目——_select_cut 的 toolpair
             # 模式保证切点工具对完整,与 proactive/emergency 循环中压缩走的是同一套切点逻辑。
             hard_ceiling = _hard_ceiling(eff_trigger, _request_window(req_headers))
-            if (
-                total_input > 0 and total_input > eff_trigger
-                and stop_reason != "end_turn" and total_input <= hard_ceiling
-            ):
-                # 问题②根治:后台建压缩条目只在「一轮真正结束」(stop_reason==end_turn)时进行——此刻对话
-                # 处于干净 user 边界,_select_cut 能切在干净点、保留段不含孤儿 tool_result。tool 循环中
-                # (tool_use / max_tokens 等)一律不建条目,避免切坏工具对;真涨大撞墙由转发前 proactive
-                # 与 400 后 emergency 兜底同步压(那两条不受此限)。
+            # 决策走 decide_compression 决策表(唯一事实来源):
+            # - defer:问题②根治——只在「一轮真正结束」(end_turn)建条目,循环中不切避免坏工具对;
+            # - bg/starvation:超硬顶的饥饿逃生,循环中也强制建条目(_select_cut toolpair 模式保证切点完整);
+            # - bg/end-turn:干净 user 边界,正常后台建条目。
+            action, reason = decide_compression(
+                "post", real_tokens=total_input, eff_trigger=eff_trigger,
+                hard_ceiling=hard_ceiling, stop_reason=stop_reason,
+            )
+            if action == "defer":
                 log.info(
                     f"[MSG] {total_input:,} tokens > trigger {eff_trigger:,} but "
                     f"stop_reason={stop_reason!r} (not end_turn) — mid tool-loop, deferring "
                     f"compression (hard ceiling {hard_ceiling:,})"
                 )
-            elif total_input > 0 and total_input > eff_trigger:
-                if stop_reason != "end_turn":
+            elif action == "bg":
+                if reason == "starvation":
                     log.info(
                         f"[MSG] {total_input:,} tokens > hard ceiling {hard_ceiling:,} — "
                         f"mid tool-loop starvation, compressing anyway (toolpair cut)"

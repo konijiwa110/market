@@ -1,5 +1,29 @@
 # ChangeLog
 
+## 1.21.0 — 压缩决策收敛为一张决策表 + 真实事故形状的回放测试(行为等价,零功能变更)
+
+### 背景
+版本评审(1.7 → 1.20.3)发现:返工最重的两族 bug(1.17.4/1.19.1 去重族、1.20.1/1.20.2 护栏族)
+全部源自同一结构问题——**压缩决策散在转发前(proactive)与响应后(bg trigger)两处**,每加一个
+条件(end_turn 闸门、硬顶、注入状态)都可能与另一处打架,且组合路况无法穷举测试,只能等线上撞出来。
+
+### 变更
+1. **决策表收敛**(`server.py` 新增 `decide_compression(stage, ...)`):纯函数、唯一事实来源,
+   pre 段(粗估口径)产 `sync|forward`,post 段(上游真实 token 口径)产 `bg|defer|skip`,
+   reason 为稳定短码。`_should_proactive_compress` 降级为组装层薄封装;响应后 if/elif 改为查表分发。
+   **所有日志原文保持不变**(`mid tool-loop starvation…` 等哨兵行照旧可 grep)。
+   去重(`claim_compression` 原子判定)与切点(`_select_cut`)不在此层,原位不动。
+2. **回放测试**(新增 `test_replay.py`):把三次真实事故的**形状**做成合成 fixture(不含真实对话)——
+   ① resume 剥 thinking(fa861c68 480k 裸奔)、② 同轮重发尾部追加指令块、③ role:system 尾巴
+   (1.20.1 风暴形状);外加**机会性回放**:本机存在真实归档时逐份校验哈希不变量(JSON 往返、
+   剥 thinking 均不得改变哈希),归档不存在自动跳过,真实对话永不入库。
+3. **决策矩阵穷举**(`test_emergency.DecideCompression` 13 例):pre/post 全路况 + 边界
+   (恰在 trigger / 恰在硬顶)+ 未知 stage 拒绝。今后新增决策条件必须先过这张矩阵。
+
+### 验证
+全套 114 测试全绿(95 → 114)。重构为行为等价:既有 proactive 测试经薄封装穿透新决策表通过,
+post 段五路况与旧 if/elif 逐条对齐(end_turn 建条目 / 循环中推迟 / 超硬顶强压 / 未超不动 / 无用量不动)。
+
 ## 1.20.3 — 哈希对 resume 免疫:剥离 thinking 块,恢复会话后深条目不再全灭
 
 ### 背景
