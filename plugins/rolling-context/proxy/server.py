@@ -1533,6 +1533,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = raw.encode("utf-8")
         self.send_response(200)
         self.send_header("content-type", "application/json; charset=utf-8")
+        # 走下载而非浏览器内打开:归档动辄数 MB JSON,直接渲染会卡死标签页;
+        # 下载成 .json 文件也方便直接丢给 AI 排查。name 已校验以 .json.gz 结尾,去 .gz 即 .json。
+        self.send_header("content-disposition", f'attachment; filename="{name[:-3]}"')
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

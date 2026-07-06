@@ -332,6 +332,9 @@ class StatsCollector:
                 "total_ms": r.get("t_total_ms", 0), "prefill_ms": r.get("t_prefill_ms", 0),
                 "gen_ms": r_gen, "injected": r.get("injected", False),
                 "status": r.get("status", 0),
+                # 请求体字节:失败行(尤其压缩器 503)没有 usage、token 列全 0,req_bytes 是唯一
+                # 能证明「实际发了多大」的字段——错误展开区与行级复制诊断都要用。
+                "req_bytes": r.get("req_bytes", 0) or 0,
                 # 单请求输出速度(tok/s)、数据块数、是否疑似缓冲、并发标记、错误来源指纹与响应明细。
                 "tps": round(r_out / (r_gen / 1000.0), 1) if (r_gen and r_out) else 0,
                 "chunks": r_chunks,

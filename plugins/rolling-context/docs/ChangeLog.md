@@ -1,5 +1,25 @@
 # ChangeLog
 
+## 1.21.1 — 看板观测三件套:失败行输入可见 / 行级复制诊断 / 归档走下载(纯观测,零决策变更)
+
+### 背景
+真实案例(07-06 16:28,摘要器调用 503):失败响应没有 usage,看板 token 列全 0、行里又没有
+请求体大小列,被误读成「没记录输入」甚至「超过模型上限」。实际 req_bytes/conv_chars 一直有落库
+(该次输入 116KB / 76,698 字符 ≈ 35k token,同请求体 3 分钟后重试成功),只是展示层没给列。
+
+### 变更(dashboard.html + stats.py recent 补 req_bytes 字段 + server.py 归档端点)
+1. **错误展开区显示本次输入**:`本次输入=NB(≈N tok)· 被摘正文=N 字符`,失败行不再无从判断
+   实际发了多大。
+2. **行级复制诊断按钮**(新列 📋):一键复制该行全部字段的纯文本(时间/模型/kind/会话/状态/
+   token 四项/req_bytes/耗时/标志位/错误元信息+响应体/归档文件名),可直接粘给 AI 排查。
+   localhost 用 clipboard API,非 secure context 退回 execCommand。
+3. **归档走下载**:服务端 `Content-Disposition: attachment`(.json.gz → .json 文件名)+ 前端
+   `download` 属性,不再浏览器内打开——数 MB JSON 直接渲染会卡死标签页,下载成文件也方便丢给 AI。
+
+### 验证
+130 测试全绿;5599 临时实例浏览器实测:17 列渲染、复制按钮点击变 ✓(剪贴板写入成功)、
+存档链接带 download 属性、curl 确认响应头 `content-disposition: attachment; filename="....json"`。
+
 ## 1.21.0 — 压缩决策收敛为一张决策表 + 真实事故形状的回放测试(行为等价,零功能变更)
 
 ### 背景

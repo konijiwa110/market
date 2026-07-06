@@ -254,6 +254,7 @@ img, video { max-width: 100%; height: auto; }
           <col style="width:52px">       <!-- 压缩 -->
           <col style="width:84px">       <!-- 状态 -->
           <col style="width:44px">       <!-- 存档 -->
+          <col style="width:40px">       <!-- 复制诊断 -->
         </colgroup>
         <thead class="text-slate-500 border-b border-slate-800">
           <tr class="text-left">
@@ -273,6 +274,7 @@ img, video { max-width: 100%; height: auto; }
             <th class="py-2 pr-3 font-medium text-center">压缩</th>
             <th class="py-2 pr-3 font-medium text-right">状态</th>
             <th class="py-2 pr-3 font-medium text-center">存档</th>
+            <th class="py-2 pr-3 font-medium text-center" title="复制本行诊断信息(可直接粘给 AI 排查)">复制</th>
           </tr>
         </thead>
         <tbody id="recentBody"></tbody>
@@ -566,11 +568,56 @@ function breakdownCell(r){
     +`<span class="text-sky-300">📝${pct(tx)}</span> `
     +`<span class="text-amber-300">🔧${pct(tu)}</span></span>`;
 }
-// 存档:超阈值的大输出/长耗时回合,点开看完整请求+响应。
+// 存档:超阈值的大输出/长耗时回合。走下载(服务端也带 attachment)——归档动辄数 MB,
+// 浏览器内直接渲染会卡死标签页;落成 .json 文件也方便直接丢给 AI 排查。
 function archiveCell(r){
   if(!r.archive_file) return '<span class="text-slate-700">·</span>';
-  return `<a href="/stats/archive/get?name=${encodeURIComponent(r.archive_file)}" target="_blank" `
-    +`class="text-emerald-400 hover:underline" title="打开完整请求+响应存档 ${esc(r.archive_file)}">📄</a>`;
+  const jsonName = r.archive_file.replace(/\.gz$/,'');
+  return `<a href="/stats/archive/get?name=${encodeURIComponent(r.archive_file)}" download="${esc(jsonName)}" `
+    +`class="text-emerald-400 hover:underline" title="下载完整请求+响应存档 ${esc(r.archive_file)}">📄</a>`;
+}
+
+// 行级诊断文本:一行的全部字段拼成给 AI 排查用的纯文本(原始数值,不带千分位)。
+function diagText(r){
+  const L = [];
+  L.push(`[rolling-context 诊断] ${new Date(r.ts*1000).toLocaleString()} (ts=${r.ts})`);
+  L.push(`model=${r.model} kind=${r.kind||'request'} session=${r.session} status=${r.status} stream_chunks=${r.chunks||0}`);
+  L.push(`tokens: input=${r.input||0} cache_read=${r.cache_read||0} cache_create=${r.cache_create||0} output=${r.output||0}`);
+  L.push(`size: req_bytes=${r.req_bytes||0}${r.conv_chars?` conv_chars=${r.conv_chars}`:''}${r.pre_tokens?` pre_tokens=${r.pre_tokens}`:''}`);
+  L.push(`timing: prefill=${r.prefill_ms||0}ms gen=${r.gen_ms||0}ms total=${r.total_ms||0}ms tok/s=${r.tps||0}${r.bursty?'(疑似缓冲突发)':''}`);
+  L.push(`flags: injected=${!!r.injected} first_compressed=${!!r.first_compressed} concurrent=${!!r.concurrent}`);
+  const out = (r.out_thinking||0)+(r.out_text||0)+(r.out_tool||0);
+  if (out) L.push(`output_chars: thinking=${r.out_thinking||0} text=${r.out_text||0} tool_use=${r.out_tool||0}`);
+  if (r.status>=400 || r.err_snippet){
+    const meta = [
+      r.err_source?`source=${r.err_source}`:'', r.err_server?`server=${r.err_server}`:'',
+      r.err_cf_ray?`cf-ray=${r.err_cf_ray}`:'', r.err_ctype?`content-type=${r.err_ctype}`:'',
+      r.err_retry_after?`retry-after=${r.err_retry_after}`:'',
+    ].filter(Boolean).join(' ');
+    if (meta) L.push(`error: ${meta}`);
+    if (r.err_snippet) L.push(`err_snippet: ${r.err_snippet}`);
+  }
+  if (r.archive_file) L.push(`archive: ${r.archive_file}(看板「存档」列可下载完整请求+响应)`);
+  return L.join('\n');
+}
+// 复制到剪贴板:localhost 是 secure context 可用 navigator.clipboard;
+// 经局域网 IP 访问(http 非 secure)退回 textarea+execCommand。
+function copyText(text){
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.cssText = 'position:fixed;opacity:0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+  return Promise.resolve();
+}
+function copyRow(i, btn){
+  const r = (state.rendered||[])[i];
+  if (!r) return;
+  copyText(diagText(r)).then(()=>{
+    const old = btn.textContent;
+    btn.textContent = '✓'; btn.classList.add('text-emerald-400');
+    setTimeout(()=>{ btn.textContent = old; btn.classList.remove('text-emerald-400'); }, 1200);
+  });
 }
 
 // ---- 最近请求表 ----
@@ -582,8 +629,9 @@ function renderRecent(rows){
     rows.map(r=>`${r.ts}:${r.status}:${r.first_compressed?1:0}:${r.output}:${r.archive_file?1:0}`).join(',');
   if (sig === _recentSig) return;
   _recentSig = sig;
-  if (!rows.length){ tb.innerHTML = '<tr><td colspan="16" class="py-4 text-center text-slate-600">暂无数据</td></tr>'; return; }
-  tb.innerHTML = rows.map(r=>{
+  state.rendered = rows;  // 复制按钮按索引取整行数据(diagText),避免往 onclick 里内嵌大段转义文本
+  if (!rows.length){ tb.innerHTML = '<tr><td colspan="17" class="py-4 text-center text-slate-600">暂无数据</td></tr>'; return; }
+  tb.innerHTML = rows.map((r,i)=>{
     const isErr = r.status>=400;
     const stColor = isErr ? 'text-rose-400' : (r.status===200 ? 'text-emerald-400' : 'text-slate-400');
     // 错误来源徽标:CF=Cloudflare 边缘,上游=sub2api origin。
@@ -643,11 +691,20 @@ function renderRecent(rows){
       <td class="py-1.5 pr-3 text-center">${r.first_compressed?'<span class="text-sky-400" title="压缩生效的第一个请求(首次用上压缩后数据)">✓</span>':'<span class="text-slate-700">·</span>'}</td>
       <td class="py-1.5 pr-3 text-right font-mono ${stColor} whitespace-nowrap"${stTitle}>${r.status||'—'}${srcBadge}</td>
       <td class="py-1.5 pr-3 text-center">${archiveCell(r)}</td>
+      <td class="py-1.5 pr-3 text-center"><button onclick="event.stopPropagation();copyRow(${i},this)"
+        class="text-slate-500 hover:text-sky-300" title="复制本行诊断信息(可直接粘给 AI 排查)">📋</button></td>
     </tr>`;
     // 错误行:追加一行可展开的「响应明细」(默认隐藏,点击错误行切换)。
     if (isErr){
+      // 本次输入:失败响应没有 usage、token 列全 0,req_bytes/conv_chars 是唯一能证明
+      // 「实际发了多大」的字段(≈ req_bytes/4 token),不展示会误判成「没记录输入」或「超限」。
+      const sizeTxt = r.req_bytes
+        ? `本次输入=${fmt(r.req_bytes)}B(≈${fmt(Math.round(r.req_bytes/4))} tok)`
+          + (r.conv_chars?` 被摘正文=${fmt(r.conv_chars)} 字符`:'')
+        : '';
       const meta = [
         `来源=${r.err_source||'?'}`,
+        sizeTxt,
         r.err_server?`server=${esc(r.err_server)}`:'',
         r.err_cf_ray?`cf-ray=${esc(r.err_cf_ray)}`:'',
         r.err_ctype?`content-type=${esc(r.err_ctype)}`:'',
@@ -664,7 +721,7 @@ function renderRecent(rows){
         ? `<div class="text-[11px] text-amber-300/90 mb-1">💡 ${esc(apiInfo.hint)}</div>` : '';
       const open = expandedRows.has(key);  // 刷新后保持上次的展开状态
       row += `<tr class="${open?'':'hidden '}bg-slate-900/70">
-        <td colspan="16" class="py-2 px-3 border-b border-slate-800">
+        <td colspan="17" class="py-2 px-3 border-b border-slate-800">
           ${msgHtml}
           <div class="text-[11px] text-slate-400 font-mono mb-1">${meta}</div>
           ${hintHtml}${apiHintHtml}
