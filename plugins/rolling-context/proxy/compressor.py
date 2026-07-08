@@ -60,6 +60,21 @@ def _strip_unsupported_1m_beta(headers: dict, model: str) -> None:
             headers.pop(hk)
 
 
+def _strip_context_management_beta(headers: dict) -> None:
+    """原地从 anthropic-beta 剥掉 context-management token(剥空则删头)。摘要请求体从不带
+    context_management/thinking,这个 beta 头对它零收益;而透传它曾令上游(疑似中转加工层据此
+    往 body 注入 clear_thinking_20251015 策略)以「strategy requires thinking to be enabled or
+    adaptive」400 拒,压缩间歇性全灭(2026-07-08 实案;间歇形态与中转多节点灰度吻合)。
+    CC 只在主请求开 thinking 时才带此 beta+context_management 字段(cli.js 实证),摘要剥掉无副作用。"""
+    for hk in [k for k in headers if k.lower() == "anthropic-beta"]:
+        kept = [t.strip() for t in str(headers[hk]).split(",")
+                if t.strip() and "context-management" not in t.lower()]
+        if kept:
+            headers[hk] = ",".join(kept)
+        else:
+            headers.pop(hk)
+
+
 def _summarizer_conn():
     """Create a connection to the summarizer server (same style as server.py)."""
     if _SUMMARIZER_SCHEME == "https":
@@ -436,6 +451,7 @@ class RollingCompressor:
         headers["content-length"] = str(len(req_body))
         headers["accept-encoding"] = "identity"
         _strip_unsupported_1m_beta(headers, self.summarizer_model)  # Haiku 不支持 1M,透传会被上游 400 拒
+        _strip_context_management_beta(headers)  # 摘要没开 thinking,透传会诱发 clear_thinking 400 拒
 
         summarizer_path = _join_path(self._summ_path, "/v1/messages")
 
@@ -461,7 +477,12 @@ class RollingCompressor:
 
             if status != 200:
                 err_snippet = resp_body.decode("utf-8", errors="replace")[:600]
-                raise RuntimeError(f"Summarization API returned {status}: {err_snippet[:500]}")
+                # 附上实际发出的 anthropic-beta:beta 头诱发的 400(1M/context-management 家族)全靠
+                # 它定位;不记的话只能去 CC 二进制里反推(2026-07-08 排障即如此,不再重演)。
+                beta_sent = next((v for k, v in headers.items() if k.lower() == "anthropic-beta"), "")
+                if beta_sent:
+                    err_snippet += f" [sent anthropic-beta: {beta_sent}]"
+                raise RuntimeError(f"Summarization API returned {status}: {err_snippet[:700]}")
             data = json.loads(resp_body)
             usage = data.get("usage") or {}
             in_tok = usage.get("input_tokens", 0) or 0
@@ -507,7 +528,7 @@ class RollingCompressor:
             "conv_chars": conv_chars,
         }
         if err_snippet and (status == 0 or status >= 400):
-            rec["err_snippet"] = err_snippet[:600]
+            rec["err_snippet"] = err_snippet[:800]  # 含追加的 [sent anthropic-beta: ...],600 会截掉尾巴
             rec["err_source"] = "summarizer"
         try:
             sink(rec)

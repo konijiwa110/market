@@ -1,5 +1,32 @@
 # ChangeLog
 
+## 1.21.2 — 摘要请求剥 context-management beta:根治 clear_thinking 400 间歇性压死压缩
+
+### 事故(2026-07-08 21:43 起,session 230062c0)
+后台压缩的摘要器调用被上游 400 拒:`clear_thinking_20251015 strategy requires thinking to be
+enabled or adaptive`。21:43–21:52 连挂 17 次,22:45 成功、23:53 又挂、00:04 又成功——间歇性,
+期间该会话 183k 一直压不下来。
+
+### 根因链
+- CC 主请求(fable,thinking:adaptive)带 beta 头 `context-management-2025-06-27` + body
+  `context_management:{edits:[{type:clear_thinking_20251015,keep:all}]}`。cli.js 实证:CC 只在
+  请求开 thinking 时才加该字段,主请求永远合法。
+- 摘要请求经「伪装模板」照抄了主请求的 anthropic-beta 头(含 context-management token),但摘要
+  body 既无 thinking 也无 context_management。
+- 光带头不该触发该校验——最可能是中转加工层见头注入 context_management 字段,注入了
+  clear_thinking 却没配 thinking → 官方 400。间歇形态与中转多节点灰度吻合(同形请求时好时坏)。
+
+### 修复(compressor.py)
+1. `_strip_context_management_beta`:摘要请求一律从 anthropic-beta 剥掉 context-management
+   token(与 1M 剥离同款;摘要体永不带 thinking/context_management,该头零收益纯风险)。
+2. 失败诊断补头值:非 200 时 err_snippet 追加 `[sent anthropic-beta: ...]`(_emit_stat 截断
+   600→800)——beta 头诱发的 400 家族(1M / context-management)以后看一眼诊断即可定位,
+   不用再反推 CC 二进制。
+
+### 验证
+新增 5 测试(剥离 3 例 + 出站请求端到端 1 例 + 400 诊断带头值 1 例),全套 135 全绿。
+遗留观察:压缩失败无退避(9 分钟 17 连发),暂不动(功能冻结),复发再议。
+
 ## 1.21.1 — 看板观测三件套:失败行输入可见 / 行级复制诊断 / 归档走下载(纯观测,零决策变更)
 
 ### 背景

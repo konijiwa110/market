@@ -113,6 +113,72 @@ class StripUnsupported1mBeta(unittest.TestCase):
         self.assertNotIn("anthropic-beta", {k.lower(): v for k, v in captured.items()})
 
 
+class StripContextManagementBeta(unittest.TestCase):
+    """摘要请求一律剥 context-management beta:摘要体不带 thinking/context_management,透传该头
+    曾诱发上游按 clear_thinking_20251015 策略校验 → 400「requires thinking to be enabled or
+    adaptive」,压缩间歇性全灭(2026-07-08 实案)。"""
+
+    def test_removes_context_management_only(self):
+        # 事故形状:CC(fable, thinking adaptive)主请求的真实 beta 串形态
+        h = {"anthropic-beta": "claude-code-20250219,oauth-2025-04-20,"
+                               "context-management-2025-06-27,interleaved-thinking-2025-05-14"}
+        compressor._strip_context_management_beta(h)
+        self.assertEqual(h["anthropic-beta"],
+                         "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
+
+    def test_drops_header_when_only_context_management(self):
+        h = {"anthropic-beta": "context-management-2025-06-27"}
+        compressor._strip_context_management_beta(h)
+        self.assertNotIn("anthropic-beta", h)
+
+    def test_header_name_and_token_case_insensitive(self):
+        h = {"Anthropic-Beta": "Context-Management-2025-06-27,foo-bar"}
+        compressor._strip_context_management_beta(h)
+        self.assertEqual(h["Anthropic-Beta"], "foo-bar")
+
+    def test_summarize_chunk_strips_it_from_outgoing_request(self):
+        captured = {}
+
+        class _CapConn:
+            def request(self, method, path, body=None, headers=None):
+                captured.update(headers or {})
+            def getresponse(self):
+                return _FakeResp(200, json.dumps(
+                    {"content": [{"type": "text", "text": "S"}], "usage": {}}).encode())
+            def close(self):
+                pass
+
+        c = compressor.RollingCompressor()
+        c._conn = lambda: _CapConn()
+        c._summarize_chunk("hi", "", {"anthropic-beta": "context-management-2025-06-27,foo-beta"})
+        beta = {k.lower(): v for k, v in captured.items()}.get("anthropic-beta", "")
+        self.assertEqual(beta, "foo-beta")
+
+    def test_400_error_reports_sent_beta_header(self):
+        """失败诊断:400 时 RuntimeError 与 err_snippet 必须带上实际发出的 anthropic-beta,
+        beta 头诱发的 400 家族(1M / context-management)不再需要反推 CC 二进制定位。"""
+        err_body = json.dumps({"type": "error", "error": {
+            "type": "invalid_request_error",
+            "message": "`clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive"}})
+
+        class _Conn400:
+            def request(self, method, path, body=None, headers=None):
+                pass
+            def getresponse(self):
+                return _FakeResp(400, err_body.encode())
+            def close(self):
+                pass
+
+        stats = []
+        c = compressor.RollingCompressor()
+        c._conn = lambda: _Conn400()
+        c.stats_sink = stats.append
+        with self.assertRaises(RuntimeError) as ctx:
+            c._summarize_chunk("hi", "", {"anthropic-beta": "foo-beta,bar-beta"})
+        self.assertIn("sent anthropic-beta: foo-beta,bar-beta", str(ctx.exception))
+        self.assertIn("sent anthropic-beta: foo-beta,bar-beta", stats[0]["err_snippet"])
+
+
 class ChunkTailMerge(unittest.TestCase):
     """_chunk_by_chars 尾块合并:尾块 < 预算 15% 时并入前一块,省一次串行摘要调用(1.20.2)。
     单条消息文本 = "**user**: " + content(10 字符前缀),content 长度按目标尺寸减 10 构造。"""
