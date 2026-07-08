@@ -113,27 +113,39 @@ class StripUnsupported1mBeta(unittest.TestCase):
         self.assertNotIn("anthropic-beta", {k.lower(): v for k, v in captured.items()})
 
 
-class StripContextManagementBeta(unittest.TestCase):
-    """摘要请求一律剥 context-management beta:摘要体不带 thinking/context_management,透传该头
-    曾诱发上游按 clear_thinking_20251015 策略校验 → 400「requires thinking to be enabled or
-    adaptive」,压缩间歇性全灭(2026-07-08 实案)。"""
+class StripBodyCoupledBetas(unittest.TestCase):
+    """摘要请求一律剥「门票型」beta(功能靠 body 字段驱动、头只是开门):摘要体永不带对应字段,
+    带票曾诱发上游按 clear_thinking_20251015 策略校验 → 400「requires thinking to be enabled or
+    adaptive」,压缩间歇性全灭(2026-07-08 实案)。compact/structured-outputs/effort 同族一并剥。"""
 
     def test_removes_context_management_only(self):
         # 事故形状:CC(fable, thinking adaptive)主请求的真实 beta 串形态
         h = {"anthropic-beta": "claude-code-20250219,oauth-2025-04-20,"
                                "context-management-2025-06-27,interleaved-thinking-2025-05-14"}
-        compressor._strip_context_management_beta(h)
+        compressor._strip_body_coupled_betas(h)
         self.assertEqual(h["anthropic-beta"],
                          "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
 
-    def test_drops_header_when_only_context_management(self):
-        h = {"anthropic-beta": "context-management-2025-06-27"}
-        compressor._strip_context_management_beta(h)
+    def test_removes_whole_family(self):
+        h = {"anthropic-beta": "claude-code-20250219,compact-2026-01-12,"
+                               "structured-outputs-2025-12-15,effort-2025-11-24"}
+        compressor._strip_body_coupled_betas(h)
+        self.assertEqual(h["anthropic-beta"], "claude-code-20250219")
+
+    def test_interleaved_thinking_is_kept(self):
+        # 观察名单:实测无害且是 CC 头形态高频常客(拟真),明确不剥
+        h = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
+        compressor._strip_body_coupled_betas(h)
+        self.assertEqual(h["anthropic-beta"], "interleaved-thinking-2025-05-14")
+
+    def test_drops_header_when_all_coupled(self):
+        h = {"anthropic-beta": "context-management-2025-06-27,compact-2026-01-12"}
+        compressor._strip_body_coupled_betas(h)
         self.assertNotIn("anthropic-beta", h)
 
     def test_header_name_and_token_case_insensitive(self):
         h = {"Anthropic-Beta": "Context-Management-2025-06-27,foo-bar"}
-        compressor._strip_context_management_beta(h)
+        compressor._strip_body_coupled_betas(h)
         self.assertEqual(h["Anthropic-Beta"], "foo-bar")
 
     def test_summarize_chunk_strips_it_from_outgoing_request(self):

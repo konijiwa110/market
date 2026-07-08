@@ -60,15 +60,22 @@ def _strip_unsupported_1m_beta(headers: dict, model: str) -> None:
             headers.pop(hk)
 
 
-def _strip_context_management_beta(headers: dict) -> None:
-    """原地从 anthropic-beta 剥掉 context-management token(剥空则删头)。摘要请求体从不带
-    context_management/thinking,这个 beta 头对它零收益;而透传它曾令上游(疑似中转加工层据此
-    往 body 注入 clear_thinking_20251015 策略)以「strategy requires thinking to be enabled or
-    adaptive」400 拒,压缩间歇性全灭(2026-07-08 实案;间歇形态与中转多节点灰度吻合)。
-    CC 只在主请求开 thinking 时才带此 beta+context_management 字段(cli.js 实证),摘要剥掉无副作用。"""
+# 「门票型」beta 黑名单:功能由 body 字段驱动、beta 头只是开门(门票)。摘要请求 body 是自己构造的
+# 单轮调用(model/max_tokens/system/messages),永远不带这些字段 → 门票零收益;而 2026-07-08 实案
+# 证明「带票无体」会被上游(疑似中转据票往 body 注入字段)校验拒:context-management 票诱发
+# clear_thinking_20251015 400。同族的 compact/structured-outputs/effort 机制相同,一并剥,不等下一炸。
+# 判据:新 beta 若其功能需要 body 字段配合、且摘要 body 不带该字段 → 加进来。
+# 观察名单(暂不剥):interleaved-thinking——同为 thinking 家族门票,但实测挂了一个月无害,
+# 且是 CC 头形态高频常客(拟真价值);若哪天炸了,[sent anthropic-beta] 诊断可秒定位。
+_BODY_COUPLED_BETA_PREFIXES = ("context-management", "compact-", "structured-outputs", "effort-")
+
+
+def _strip_body_coupled_betas(headers: dict) -> None:
+    """原地从 anthropic-beta 剥掉「门票型」token(见 _BODY_COUPLED_BETA_PREFIXES),剥空则删头。
+    CC 只在主请求用到对应功能时才带票+字段(cli.js 实证),摘要请求剥票无副作用。"""
     for hk in [k for k in headers if k.lower() == "anthropic-beta"]:
         kept = [t.strip() for t in str(headers[hk]).split(",")
-                if t.strip() and "context-management" not in t.lower()]
+                if t.strip() and not t.strip().lower().startswith(_BODY_COUPLED_BETA_PREFIXES)]
         if kept:
             headers[hk] = ",".join(kept)
         else:
@@ -451,7 +458,7 @@ class RollingCompressor:
         headers["content-length"] = str(len(req_body))
         headers["accept-encoding"] = "identity"
         _strip_unsupported_1m_beta(headers, self.summarizer_model)  # Haiku 不支持 1M,透传会被上游 400 拒
-        _strip_context_management_beta(headers)  # 摘要没开 thinking,透传会诱发 clear_thinking 400 拒
+        _strip_body_coupled_betas(headers)  # 门票型 beta:摘要 body 无对应字段,透传曾诱发 400(clear_thinking)
 
         summarizer_path = _join_path(self._summ_path, "/v1/messages")
 

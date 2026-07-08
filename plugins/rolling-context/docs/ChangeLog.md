@@ -1,5 +1,24 @@
 # ChangeLog
 
+## 1.21.3 — 剥离推广为「门票型 beta」家族:不等下一炸
+
+### 背景
+1.21.2 只剥了 context-management(已炸的那个)。但同一结构缺陷(伪装模板照抄主请求头 +
+摘要 body 自建 → 头体不一致)下,CC 二进制常量池里还有同族的票:`compact-2026-01-12`、
+`structured-outputs-2025-12-15`、`effort-2025-11-24`——全是「功能靠 body 字段驱动、头只是门票」,
+摘要 body 永不带对应字段,带票零收益、有被上游/中转「见票校验或注入」的同款风险(1M 与
+context-management 已分别炸过一次,黑名单不该一次只追一个)。
+
+### 变更(compressor.py)
+`_strip_context_management_beta` 推广为 `_strip_body_coupled_betas`:按前缀黑名单
+`_BODY_COUPLED_BETA_PREFIXES`(context-management / compact- / structured-outputs / effort-)
+一律剥。判据写死在注释:新 beta 若功能需 body 字段配合、且摘要 body 不带 → 加名单。
+观察名单(明确不剥):interleaved-thinking——实测挂一个月无害,且是 CC 头形态高频常客(拟真
+价值);若炸,1.21.2 的 [sent anthropic-beta] 诊断可秒定位。
+
+### 验证
+测试同步改名并补 2 例(全家族剥净、interleaved 保留),全套 137 全绿。
+
 ## 1.21.2 — 摘要请求剥 context-management beta:根治 clear_thinking 400 间歇性压死压缩
 
 ### 事故(2026-07-08 21:43 起,session 230062c0)
