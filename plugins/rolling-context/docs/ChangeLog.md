@@ -1,5 +1,47 @@
 # ChangeLog
 
+## 1.21.4 — 延迟 reap + 注入后体积复检:根治「深度倒退 → 1.8M 裸透 400 风暴」
+
+### 事故(2026-07-09 19:41,session 230062c0,fable 1M 窗)
+子压缩条目 promote 时父条目(覆盖 0-8071)被立即 reap;285ms 后子条目失配(used=False,
+一次都没命中过),find_match 退到更浅的旧条目(0-6019),保留段 2266 条原始消息含全量
+图片 ≈1.8M tokens 原样透传 → 上游 400 `prompt is too long: 1806356 > 1000000`。随后
+starvation 重压 + proactive 全量重压(2.5M est,317s 后 502)循环,看板满屏 haiku 压缩,
+19:52 才自愈。
+
+### 根因链(全部实证:store 条目 [34]/[35] 哈希链交叉滑窗 + CC transcript hash 定位)
+1. **子链覆盖了仍会漂移的近端消息**:子链 149 条对应 raw[8072:8221](压缩时的「次新」段),
+   其中 raw[8113](19:09:41 一条带 2 附件的 Bash tool_result)在 80 秒内被 CC 改变表示——
+   一条变两条。1.20.3 thinking 的同族(history drift),但这次是**消息数量**漂移,哈希
+   免疫救不了。链前 41 条完全对齐、[41] 不存在、[42:] 整体右移一位,交叉验证坐实。
+2. **promote 即 reap = 拆安全网**:父若还在,这发照样命中 8071,啥事没有。
+3. **注入 = known-good 尺寸的假设被打破**:injected=True 跳过 proactive 预检、也被挡在
+   emergency 兜底门外(`not injected or prewarm`),1.8M 就这样发了出去,400 裸透给 CC。
+
+### 变更(server.py)
+- **延迟 reap**:promote_pending 不再立即回收父;新增 `store.reap_parent(entry)`,在子条目
+  首次真实命中注入(used 首次置 True)时才兑现。父子共存期 find_match 仍选 end 最深者,
+  正确性不变,只多占一槽(孤儿由 _prune_locked 回收)。深度倒退→裸奔路径从机制上消灭。
+- **注入后体积复检**:决策表 "pre" 分支新增 window 参数——injected 且 est 仍超模型窗口
+  → `("sync", "injected-over-window")` 同步重压,不放行;est 改为基于「当前 payload 实际
+  形态」编码估算(此前用注入前的 raw_body,量不出倒退后的真实体积)。
+- **emergency 兜底放宽**:400 'too long' 一律放行同步重压(去掉 `not injected or prewarm`
+  闸门),_looks_too_long + 只重试一发的上限不变。CC 永不见 400 的承诺补上最后一块。
+- **诊断修正**:`_log_no_match` 从 0 偏移比对改为滑窗最佳部分匹配(旧输出对链在中部的增量
+  子条目永远是「diff at [0]」废话,本次排障实翻车);新增 `_warn_depth_regression`——同
+  会话注入深度倒退即 WARNING(事故第一现场信号,此前靠人肉对比两行 Injecting 才看出来)。
+
+### 验证
+新增 13 测试:决策表矩阵 +4(injected-over-window / within-window / not-injected 不受
+window 影响)、ProactiveGate 改签名 +2、延迟 reap 生命周期 +2、深度倒退告警 +4、滑窗
+诊断 +2、回放 fixture NearTailDriftDepthRegression 3 例(父兜底漂移 / 无漂移子胜出并
+reap / 反事实:改回立即 reap 立刻红)。全套 150 全绿。
+
+### 观察项(暂不动)
+- key 链是否避开「距尾 N 条」消息:会伤压缩比;延迟 reap 落地后此漂移只导致一次温和重压,
+  先观察发生频率。
+- 摘要失败无退避(17 连发遗留)与摘要同步超时兜底:仍在待办。
+
 ## 1.21.3 — 剥离推广为「门票型 beta」家族:不等下一炸
 
 ### 背景

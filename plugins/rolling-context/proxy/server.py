@@ -490,26 +490,44 @@ class CompressionStore:
             return best, best_end
 
     def _log_no_match(self, msg_hashes: list, messages: list):
-        """未命中诊断(debug 级,仅在整体无命中时调用一次):挑第一条存有原文的候选,
-        打印其哈希链首个失配位置两端的内容,定位「内容为何漂移」。已在 find_match 的锁内调用。"""
+        """未命中诊断(debug 级,仅在整体无命中时调用一次):对每个存有原文的候选做滑窗部分
+        匹配,报告最佳者的断裂点两端内容,定位「内容为何漂移」。已在 find_match 的锁内调用。
+
+        1.21.4 修正:此前按 0 偏移逐位比对——增量子条目的链对应 raw 中部,0 对齐必然输出
+        「diff at [0]」的废话(7-9 事故排障时真误导过)。现在从链首 hash 的每个出现位置起数
+        连续匹配长度,取全场最长者,报告链在第几条断、两端各是什么。"""
+        best = None  # (matched_len, entry, request_offset)
         for entry in self._compressions:
             oh = entry.get("original_hashes") or []
             dbg = entry.get("_debug_messages")
             if not oh or not dbg:
                 continue
-            idx = next((i for i in range(min(len(oh), len(msg_hashes))) if oh[i] != msg_hashes[i]), None)
-            if idx is None:
-                continue
-            stored = dbg[idx] if idx < len(dbg) else None
-            incoming = messages[idx] if messages and idx < len(messages) else None
-            if stored and incoming:
-                log.debug(
-                    f"[MATCH] No match among {len(self._compressions)} stored; first diff at [{idx}] "
-                    f"role={stored.get('role')}:\n  STORED:   {str(stored.get('content', ''))[:300]}\n"
-                    f"  INCOMING: {str(incoming.get('content', ''))[:300]}"
-                )
-                return
-        log.debug(f"[MATCH] No match among {len(self._compressions)} stored compression(s)")
+            for off, h in enumerate(msg_hashes):
+                if h != oh[0]:
+                    continue
+                n = 1
+                while n < len(oh) and off + n < len(msg_hashes) and msg_hashes[off + n] == oh[n]:
+                    n += 1
+                if best is None or n > best[0]:
+                    best = (n, entry, off)
+        if best is None:
+            log.debug(
+                f"[MATCH] No match among {len(self._compressions)} stored compression(s); "
+                f"no candidate's chain head appears in this request"
+            )
+            return
+        n, entry, off = best
+        oh = entry.get("original_hashes") or []
+        dbg = entry.get("_debug_messages") or []
+        stored = dbg[n] if n < len(dbg) else None
+        incoming = messages[off + n] if messages and off + n < len(messages) else None
+        log.debug(
+            f"[MATCH] No match among {len(self._compressions)} stored; best partial: "
+            f"{n}/{len(oh)} chain hashes matched at request offset {off}, breaks at chain[{n}] "
+            f"(request[{off + n}]):\n"
+            f"  STORED:   {str((stored or {}).get('content', ''))[:300]}\n"
+            f"  INCOMING: {str((incoming or {}).get('content', ''))[:300]}"
+        )
 
     def covers(self, msg_hashes: list, exclude=None) -> bool:
         """库里是否已有压缩其哈希链出现在 msg_hashes 中(排除 exclude 指向的条目)。
@@ -605,21 +623,32 @@ class CompressionStore:
         with self._lock:
             self._compressions = [e for e in self._compressions if e is not entry]
 
-    def promote_pending(self) -> int:
-        """把已就绪的 pending 压缩转正为活条目,回收其父条目(死条目),并落盘。返回转正条数。
+    def reap_parent(self, entry: dict) -> bool:
+        """回收 entry 的父条目(延迟 reap 的兑现点,见 promote_pending)。
+        调用时机:entry 首次真实命中注入——此刻才证明子链能命中 CC 的 raw,父的兜底使命完成。
+        父可能已被 prune 或被并发 reap,remove 按 identity 过滤天然容错;幂等(pop 后再调无事)。"""
+        parent = entry.pop("parent", None)
+        if parent is None or parent is entry:
+            return False
+        self.remove(parent)
+        return True
 
-        子压缩转正(prefix 就绪)后,它建立其上的父条目此后永不会再被选为 best → 回收掉,
-        使每个会话在表里只剩 1 条活条目,避免死条目把全局名额(STORE_MAX_ENTRIES)堆满、
-        把别的并发会话挤出去。先置 prefix 再删父,中间无空窗;父可能为 None(本会话首压)
-        或已被删,remove 容错。
+    def promote_pending(self) -> int:
+        """把已就绪的 pending 压缩转正为活条目,并落盘。返回转正条数。
+
+        1.21.4 延迟 reap:转正时【不再】立即回收父条目,父保留到子条目首次真实命中注入
+        (注入路径首次置 used 时调用 reap_parent)才回收。此前 promote 即 reap 是 7-9 事故引擎:
+        子链收进了仍会漂移的近端消息(CC 对带附件 tool_result 的历史表示不稳定,80 秒内一条
+        变两条),子转正即秒失配、父已被删 → find_match 退到更浅的旧条目 → 裸露段 1.8M 原样
+        透传超窗 400 风暴。父子共存期 find_match 仍选 end 最深者(子命中必比父深),正确性
+        不受影响,只多占一个槽(死子/孤父由 _prune_locked 按上限回收)。
 
         字段转正(prefix/original_hashes/pending*)在锁内完成,与 covers/find_match 同锁互斥,
         使去重判定永远读到一致快照(不会撞见 pending 已清而 original_hashes 尚未就绪的半态);
-        含 IO 的收尾(remove/persist/log)移到锁外——_lock 不可重入,remove/persist 自带锁,
+        含 IO 的收尾(persist/log)移到锁外——_lock 不可重入,persist 自带锁,
         放锁内会二次获取而死锁;日志放锁外则避免持锁做盘 IO 阻塞并发热路径。"""
         promoted = 0
-        reaped = []        # 待回收的父条目,锁外统一 remove
-        done = []          # (prefix_len, orig_len, had_parent),锁外打印,不在锁内做日志 IO
+        done = []          # (prefix_len, orig_len, has_parent),锁外打印,不在锁内做日志 IO
         with self._lock:
             for entry in self._compressions:  # 已持锁,_compressions 成员不会被并发改,无需拷贝
                 if entry.get("pending") is None:
@@ -629,17 +658,13 @@ class CompressionStore:
                 entry["pending"] = None
                 entry["pending_hashes"] = None
                 promoted += 1
-                parent = entry.pop("parent", None)
-                if parent is not None and parent is not entry:
-                    reaped.append(parent)
-                done.append((len(entry["prefix"]), len(entry["original_hashes"]), parent is not None))
-        for parent in reaped:
-            self.remove(parent)  # remove 自带锁;放锁外避免对不可重入 Lock 二次获取
-        for prefix_len, orig_len, had_parent in done:
+                done.append((len(entry["prefix"]), len(entry["original_hashes"]),
+                             entry.get("parent") is not None))
+        for prefix_len, orig_len, has_parent in done:
             log.info(
                 f"[MSG] Compression promoted: {prefix_len} prefix messages "
                 f"replacing {orig_len} originals"
-                f"{' (reaped 1 parent)' if had_parent else ''}"
+                f"{' (parent kept until first hit)' if has_parent else ''}"
             )
         if promoted:
             self.persist()  # 转正即落盘,重启后免冷启动满历史发送
@@ -651,6 +676,24 @@ class CompressionStore:
 
 
 store = CompressionStore()
+
+# 会话 → 上次注入替换深度(match_end)。同一会话消息只增,注入深度理应单调不减;
+# 倒退 = 更深的条目失配/被删,保留段暴涨(7-9 事故:8071 → 6019,裸露段 1.8M 超窗)。
+# 仅观测告警,不改行为。粗封顶防长驻泄漏:超上限直接清空重计(丢的只是告警基线)。
+_inject_depth = {}
+_INJECT_DEPTH_MAX_SESSIONS = 256
+
+
+def _warn_depth_regression(sess: str, match_end: int):
+    if len(_inject_depth) > _INJECT_DEPTH_MAX_SESSIONS:
+        _inject_depth.clear()
+    prev = _inject_depth.get(sess)
+    if prev is not None and match_end < prev:
+        log.warning(
+            f"[MSG] Injection depth regressed: replaced 0-{prev} last time, only 0-{match_end} now "
+            f"— a deeper compression stopped matching (history drift?); retained tail grows accordingly"
+        )
+    _inject_depth[sess] = match_end
 
 # 请求级统计采集器:每个真实 /v1/messages 生成调用记一条(token + 各类耗时),
 # 内存环形缓冲 + JSONL 落盘,供 /stats 看板读取。
@@ -1066,6 +1109,7 @@ def decide_compression(
     real_tokens: int = 0,
     eff_trigger: int = 0,
     hard_ceiling: int = 0,
+    window: int = 0,
     stop_reason=None,
     injected: bool = False,
     is_count: bool = False,
@@ -1094,6 +1138,12 @@ def decide_compression(
         if is_count:
             return "forward", "count-probe"
         if injected:
+            # 注入后体积复检(1.21.4):「注入 = known-good 尺寸」的假设被 7-9 事故打破——
+            # 注入深度倒退(命中了更浅的旧条目)时,保留段可达 1.8M tokens,原样转发必 400。
+            # 注入结果估算仍超模型窗口就同步重压,不放行;窗口内则维持 cache-hit 放行
+            # (正常注入远小于窗口,不会误触发这条昂贵路径)。
+            if window and est_tokens > window:
+                return "sync", "injected-over-window"
             return "forward", "cache-hit"
         if est_tokens > eff_trigger:
             return "sync", "over-trigger"
@@ -1111,17 +1161,19 @@ def decide_compression(
     raise ValueError(f"unknown stage: {stage!r}")
 
 
-def _should_proactive_compress(raw_body_len: int, req_headers: dict, is_count: bool, injected: bool) -> bool:
-    """转发前判定的组装层:算粗估与有效 trigger,决策本体走 decide_compression 决策表。"""
-    action, _ = decide_compression(
+def _should_proactive_compress(raw_body_len: int, req_headers: dict, is_count: bool, injected: bool):
+    """转发前判定的组装层:算粗估与有效 trigger,决策本体走 decide_compression 决策表。
+    返回 (should_sync, reason)——reason 供调用点区分「冷启动超 trigger」与「注入后仍超窗」日志。"""
+    action, reason = decide_compression(
         "pre",
         est_tokens=_estimate_body_tokens(raw_body_len),
         eff_trigger=_effective_trigger(req_headers),
+        window=_request_window(req_headers),
         injected=injected,
         is_count=is_count,
         proactive_enabled=PROACTIVE_COMPRESS,
     )
-    return action == "sync"
+    return action == "sync", reason
 
 
 def _validate_tool_pairs(messages: list) -> list:
@@ -1653,11 +1705,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     payload["messages"] = merged
                     msg_chars = merged_chars
                     injected = True
+                    _warn_depth_regression(_get_sess(), match_end)  # 深度倒退观测(7-9 事故形态)
                     # 该压缩条目第一次被注入 → 标记为「压缩生效的第一个请求」,并带上压缩前规模。
                     if not match.get("used"):
                         match["used"] = True
                         first_compressed = True
                         pre_compress_tokens = match.get("pre_tokens", 0)
+                        # 延迟 reap 兑现:子首次真实命中,父的兜底使命完成,此刻才回收。
+                        if store.reap_parent(match):
+                            log.info("[MSG] Child compression first hit — reaped its parent entry")
                 else:
                     log.info(
                         f"[MSG] Compression no longer helps: "
@@ -1675,15 +1731,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 压后第一发即缩到 target 上下,且压缩条目当场登记进 store,后续请求直接命中、不再付这次同步延迟。
         prewarm = False
         proactive_entry = None
+        # 1.21.4:est 基于「当前 payload 实际形态」而非 CC 原始体——注入后 raw_body 是注入前的
+        # 尺寸,用它估算会把已收缩的请求误判、也量不出「注入深度倒退后保留段仍 1.8M」的事故形态。
+        # 这里提前编码一次,未被 proactive 改写时直接复用给转发,不重复 dumps。
+        body = json.dumps(payload).encode()
         # 估算前先扣图片超额字节:base64 图按 ÷4 会虚增十几万 token/张,带图透传请求会被误判超 trigger。
-        body_est_len = max(0, len(raw_body) - _image_excess_bytes(current_messages))
-        if _should_proactive_compress(body_est_len, req_headers, is_count, injected):
+        body_est_len = max(0, len(body) - _image_excess_bytes(current_messages))
+        should_sync, pre_reason = _should_proactive_compress(body_est_len, req_headers, is_count, injected)
+        if should_sync:
             est_tokens = _estimate_body_tokens(body_est_len)
-            log.info(
-                f"[MSG] Proactive compress: ~{est_tokens:,} est tokens "
-                f"(body {len(raw_body):,} B, est-adjusted {body_est_len:,} B) "
-                f"> trigger {_effective_trigger(req_headers):,}, no cache hit — compressing before forward"
-            )
+            if pre_reason == "injected-over-window":
+                # 注入命中但结果仍超窗(深度倒退/条目过浅):原样转发必 400,当场同步重压。
+                log.warning(
+                    f"[MSG] Injected result still over window: ~{est_tokens:,} est tokens "
+                    f"(body {len(body):,} B, est-adjusted {body_est_len:,} B) "
+                    f"> window {_request_window(req_headers):,} — sync compressing before forward"
+                )
+            else:
+                log.info(
+                    f"[MSG] Proactive compress: ~{est_tokens:,} est tokens "
+                    f"(body {len(body):,} B, est-adjusted {body_est_len:,} B) "
+                    f"> trigger {_effective_trigger(req_headers):,}, no cache hit — compressing before forward"
+                )
             new_msgs = None
             try:
                 # reported 传 body 粗估(比 msg_chars//3 更贴近真实,含 system+tools),供压缩器定 keep 比例。
@@ -1699,9 +1768,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 msg_chars = compressor._count_chars(new_msgs)
                 injected = True
                 prewarm = True
+                body = json.dumps(payload).encode()  # payload 已改写,重编码
 
         # Forward request — strip Accept-Encoding so we get plain text SSE
-        body = json.dumps(payload).encode()
         headers = _forward_headers(req_headers, body, strip_encoding=True)
 
         log.info(f"[MSG] Forwarding to {UPSTREAM_URL}{self.path} ({len(body):,} bytes)")
@@ -1750,10 +1819,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # 那发超限摘要请求得以成功,把真实 transcript 焊小。最多重试一发,压不动/仍失败则原样回 400。
             prebuffered = None  # 非重试的 400:已读出的错误体,直接回给 CC(不再走流式读取)
             emergency_entry = None  # 同步兜底登记的条目;随后若触发后台压缩,用它当父条目回收
-            # prewarm 的请求虽已 injected,但主动压缩按粗估定的 keep 比例可能偏松、压后仍超限;放行让它再走
-            # 一次 emergency,用 400 体里上游自报的真实 token 数重压,保住「CC 永不见 400」的兜底。命中真实
-            # 压缩条目(match)而 injected 的请求不放行——那已是 known-good 尺寸,无需二次压。
-            if EMERGENCY_COMPRESS and not is_count and (not injected or prewarm) and resp.status == 400:
+            # 1.21.4:400 'too long' 一律放行 emergency(此前 match 注入的请求被「已是 known-good
+            # 尺寸」假设挡在门外——7-9 事故证明注入深度倒退时保留段可达 1.8M,那发 400 就这样裸透给
+            # 了 CC)。_looks_too_long 闸门 + 只重试一发的上限不变,无风暴风险;用 400 体里上游自报
+            # 的真实 token 数重压,保住「CC 永不见 400」的兜底。
+            if EMERGENCY_COMPRESS and not is_count and resp.status == 400:
                 err_preview = resp.read()  # 400 体很小
                 conn.close()
                 if _looks_too_long(err_preview):

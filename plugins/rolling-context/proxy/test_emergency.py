@@ -343,7 +343,9 @@ class PromoteReaping(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_child_promotion_reaps_parent(self):
+    def test_child_promotion_keeps_parent_until_first_hit(self):
+        """1.21.4 延迟 reap:promote 后父子共存(子可能收进了仍会漂移的近端消息、秒失配——
+        7-9 事故),父保留兜底;子首次真实命中(reap_parent)才回收父。"""
         s = server.CompressionStore()
         parent = s.add()  # an already-active prior compression for this session
         parent["original_hashes"] = ["p0", "p1"]
@@ -356,15 +358,37 @@ class PromoteReaping(unittest.TestCase):
 
         n = s.promote_pending()
         self.assertEqual(n, 1)
-        # parent is gone, child is the sole live entry, now promoted
-        self.assertEqual(len(s.compressions), 1)
-        self.assertIs(s.compressions[0], child)
+        # promote 后:父仍在(兜底),子已转正,父子共存
+        self.assertEqual(len(s.compressions), 2)
+        self.assertIn(parent, s.compressions)
         self.assertEqual(child["original_hashes"], ["c0", "c1"])
         self.assertIsNone(child["pending"])
-        # and the reaped state is what got persisted
+        self.assertIs(child.get("parent"), parent)
+        # 持久化两条都在(重启后父仍能兜底)
         s2 = server.CompressionStore()
-        self.assertEqual(len(s2.compressions), 1)
-        self.assertEqual(s2.compressions[0]["original_hashes"], ["c0", "c1"])
+        self.assertEqual(len(s2.compressions), 2)
+
+        # 子首次真实命中 → 兑现 reap:父被回收,子成唯一活条目
+        self.assertTrue(s.reap_parent(child))
+        self.assertEqual(len(s.compressions), 1)
+        self.assertIs(s.compressions[0], child)
+        self.assertNotIn("parent", child)
+        # 幂等:再调无事
+        self.assertFalse(s.reap_parent(child))
+
+    def test_reap_parent_tolerates_pruned_parent(self):
+        """父已被 prune/并发 reap 时,reap_parent 仍安全(remove 按 identity 容错)。"""
+        s = server.CompressionStore()
+        parent = s.add()
+        parent["original_hashes"] = ["p0"]
+        parent["prefix"] = [{"role": "user", "content": "S1"}]
+        child = s.add()
+        child["original_hashes"] = ["c0"]
+        child["prefix"] = [{"role": "user", "content": "S2"}]
+        child["parent"] = parent
+        s.remove(parent)  # 模拟父先被 prune
+        self.assertTrue(s.reap_parent(child))  # pop 到了引用,remove 无害
+        self.assertEqual(len(s.compressions), 1)
 
     def test_first_compression_has_no_parent_to_reap(self):
         s = server.CompressionStore()
@@ -383,6 +407,78 @@ class PromoteReaping(unittest.TestCase):
         e["prefix"] = [{"role": "user", "content": "S"}]
         self.assertEqual(s.promote_pending(), 0)
         self.assertEqual(len(s.compressions), 1)
+
+
+class DepthRegressionWarning(unittest.TestCase):
+    """_warn_depth_regression:同会话注入深度倒退(更深条目失配)时告警——7-9 事故的
+    第一现场信号,当时靠人肉对比两行 Injecting 才发现 8071→6019。仅观测,不改行为。"""
+
+    def setUp(self):
+        server._inject_depth.clear()
+
+    def test_warns_on_regression(self):
+        server._warn_depth_regression("sess-a", 8071)
+        with self.assertLogs(server.log, level="WARNING") as cm:
+            server._warn_depth_regression("sess-a", 6019)
+        self.assertTrue(any("depth regressed" in m for m in cm.output))
+
+    def test_no_warn_on_monotonic_growth(self):
+        server._warn_depth_regression("sess-a", 6019)
+        with self.assertNoLogs(server.log, level="WARNING"):
+            server._warn_depth_regression("sess-a", 8071)
+            server._warn_depth_regression("sess-a", 8071)  # 持平也不告警
+
+    def test_sessions_are_independent(self):
+        server._warn_depth_regression("sess-a", 8071)
+        with self.assertNoLogs(server.log, level="WARNING"):
+            server._warn_depth_regression("sess-b", 31)  # 另一会话的首采样,不是倒退
+
+    def test_capped_dict_resets_quietly(self):
+        for i in range(server._INJECT_DEPTH_MAX_SESSIONS + 1):
+            server._warn_depth_regression(f"s{i}", 100)
+        server._warn_depth_regression("overflow", 50)  # 触发清空后首采样,不炸不告警
+        self.assertLessEqual(len(server._inject_depth), server._INJECT_DEPTH_MAX_SESSIONS + 1)
+
+
+class NoMatchSlidingDiagnostics(unittest.TestCase):
+    """_log_no_match 滑窗部分匹配:此前按 0 偏移比对,对链在 raw 中部的增量子条目永远输出
+    「diff at [0]」废话(7-9 排障实翻车)。现在要求报告最长部分匹配的断点及两端内容。"""
+
+    def _mk_store(self):
+        s = server.CompressionStore()
+        msgs = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+        entry = s.add()
+        # 链对应「请求中部」msgs[10:16],且在第 3 条(链[3]=msgs[13])处与请求漂移
+        covered = msgs[10:16]
+        entry["original_hashes"] = server._hash_messages(covered)
+        entry["prefix"] = [{"role": "user", "content": "[ROLLING_CONTEXT_SUMMARY] x"}]
+        entry["_debug_messages"] = covered
+        request = list(msgs)
+        request[13] = {"role": "user", "content": "DRIFTED"}  # 链[3] 位置内容漂移
+        return s, request
+
+    def test_reports_partial_match_break_position(self):
+        s, request = self._mk_store()
+        with self.assertLogs(server.log, level="DEBUG") as cm:
+            best, end = s.find_match(server._hash_messages(request), request)
+        self.assertIsNone(best)
+        out = "\n".join(cm.output)
+        self.assertIn("best partial: 3/6", out)          # 链前 3 条匹配,断在 chain[3]
+        self.assertIn("request offset 10", out)          # 中部偏移被正确报告(旧实现只会说 [0])
+        self.assertIn("m13", out)                        # STORED 端原文
+        self.assertIn("DRIFTED", out)                    # INCOMING 端原文
+
+    def test_no_shared_head_reports_cleanly(self):
+        s = server.CompressionStore()
+        entry = s.add()
+        entry["original_hashes"] = server._hash_messages([{"role": "user", "content": "elsewhere"}])
+        entry["prefix"] = [{"role": "user", "content": "[ROLLING_CONTEXT_SUMMARY] x"}]
+        entry["_debug_messages"] = [{"role": "user", "content": "elsewhere"}]
+        request = [{"role": "user", "content": "unrelated"}]
+        with self.assertLogs(server.log, level="DEBUG") as cm:
+            best, _ = s.find_match(server._hash_messages(request), request)
+        self.assertIsNone(best)
+        self.assertTrue(any("no candidate's chain head" in m for m in cm.output))
 
 
 class BackgroundCompressionPublish(unittest.TestCase):
@@ -713,8 +809,10 @@ class EffectiveTrigger(unittest.TestCase):
 
 
 class ProactiveGate(unittest.TestCase):
-    """_should_proactive_compress = 开关开 + 非 count + 未注入 + body//4 超有效 trigger。
-    body 粗估偏低估,故据此判超是保守的(只在请求确实很大时触发)。"""
+    """_should_proactive_compress = 开关开 + 非 count +(未注入超 trigger | 已注入仍超窗)。
+    body 粗估偏低估,故据此判超是保守的(只在请求确实很大时触发)。
+    1.21.4 起返回 (should_sync, reason) 元组;injected 不再无条件放行——注入深度倒退后
+    保留段仍可超窗(7-9 事故 1.8M),est 超窗就同步重压。"""
 
     def setUp(self):
         self._saved = (server.PROACTIVE_COMPRESS, server.TRIGGER_TOKENS, server.CONTEXT_WINDOW_OVERRIDE)
@@ -730,27 +828,40 @@ class ProactiveGate(unittest.TestCase):
 
     def test_fires_when_estimate_exceeds_trigger(self):
         # 无 1m 头 → 200k 窗口 → eff_trigger=160k;644001//4 = 161000 > 160000
-        self.assertTrue(server._should_proactive_compress(644_001, {}, False, False))
+        should, reason = server._should_proactive_compress(644_001, {}, False, False)
+        self.assertTrue(should)
+        self.assertEqual(reason, "over-trigger")
 
     def test_no_fire_when_estimate_under_trigger(self):
-        self.assertFalse(server._should_proactive_compress(600_000, {}, False, False))  # //4=150000
+        should, _ = server._should_proactive_compress(600_000, {}, False, False)  # //4=150000
+        self.assertFalse(should)
 
     def test_no_fire_for_count_probe(self):
-        self.assertFalse(server._should_proactive_compress(10_000_000, {}, True, False))
+        should, _ = server._should_proactive_compress(10_000_000, {}, True, False)
+        self.assertFalse(should)
 
-    def test_no_fire_when_already_injected(self):
-        # 已命中缓存注入(小请求)→ 不再主动压
-        self.assertFalse(server._should_proactive_compress(10_000_000, {}, False, True))
+    def test_injected_within_window_forwards(self):
+        # 已注入且注入结果在窗口内(200k 窗,700000//4=175k < 200k)→ 放行,不再主动压
+        should, reason = server._should_proactive_compress(700_000, {}, False, True)
+        self.assertFalse(should)
+        self.assertEqual(reason, "cache-hit")
+
+    def test_injected_still_over_window_syncs(self):
+        # 7-9 事故形态:注入深度倒退,est 仍超模型窗口(200k 窗,10M//4=2.5M)→ 同步重压不放行
+        should, reason = server._should_proactive_compress(10_000_000, {}, False, True)
+        self.assertTrue(should)
+        self.assertEqual(reason, "injected-over-window")
 
     def test_no_fire_when_disabled(self):
         server.PROACTIVE_COMPRESS = False
-        self.assertFalse(server._should_proactive_compress(10_000_000, {}, False, False))
+        should, _ = server._should_proactive_compress(10_000_000, {}, False, False)
+        self.assertFalse(should)
 
     def test_1m_window_raises_the_bar(self):
         server.TRIGGER_TOKENS = 320_000
         h = {"anthropic-beta": "context-1m-2025-08-07"}  # 真 1M → eff_trigger=320k(<900k 不夹)
-        self.assertFalse(server._should_proactive_compress(1_000_000, h, False, False))  # //4=250000
-        self.assertTrue(server._should_proactive_compress(1_400_001, h, False, False))   # //4=350000
+        self.assertFalse(server._should_proactive_compress(1_000_000, h, False, False)[0])  # //4=250000
+        self.assertTrue(server._should_proactive_compress(1_400_001, h, False, False)[0])   # //4=350000
 
     def test_image_excess_bytes_deducts_base64_over_cap(self):
         # 600KB 图片 base64 → 真实 ~600 tok(b64//1000),超额 = 600000 - 600*4 = 597600
@@ -1069,8 +1180,26 @@ class DecideCompression(unittest.TestCase):
                                                    is_count=True), ("forward", "count-probe"))
 
     def test_pre_cache_hit(self):
+        # 注入且未超窗(或未知窗口)→ 放行。window=0(未知)时保守放行,维持 1.21.3 前行为。
         self.assertEqual(server.decide_compression("pre", est_tokens=999_999, eff_trigger=180_000,
                                                    injected=True), ("forward", "cache-hit"))
+
+    def test_pre_injected_within_window_forwards(self):
+        self.assertEqual(server.decide_compression("pre", est_tokens=740_000, eff_trigger=180_000,
+                                                   window=1_000_000, injected=True),
+                         ("forward", "cache-hit"))
+
+    def test_pre_injected_over_window_syncs(self):
+        # 7-9 事故:注入深度倒退(命中更浅旧条目),保留段 est 1.8M > 1M 窗 → 原样转发必 400,
+        # 必须当场同步重压。「注入 = known-good 尺寸」假设的矩阵化否定。
+        self.assertEqual(server.decide_compression("pre", est_tokens=1_806_356, eff_trigger=180_000,
+                                                   window=1_000_000, injected=True),
+                         ("sync", "injected-over-window"))
+
+    def test_pre_not_injected_ignores_window(self):
+        # 未注入路径不受 window 参数影响:超 trigger 就 sync(原语义不变)
+        self.assertEqual(server.decide_compression("pre", est_tokens=180_001, eff_trigger=180_000,
+                                                   window=1_000_000), ("sync", "over-trigger"))
 
     def test_pre_over_trigger_syncs(self):
         self.assertEqual(server.decide_compression("pre", est_tokens=180_001, eff_trigger=180_000),
