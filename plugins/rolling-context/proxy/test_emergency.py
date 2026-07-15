@@ -440,6 +440,103 @@ class DepthRegressionWarning(unittest.TestCase):
         self.assertLessEqual(len(server._inject_depth), server._INJECT_DEPTH_MAX_SESSIONS + 1)
 
 
+class DepthRegressionForensics(unittest.TestCase):
+    """深度倒退告警的现场取证(1.21.6,与 _log_no_match 同款 `_diff_chain_break`):倒退时不再
+    只报「深度变浅」的数字——那只够发现问题,查 7-15 事故时靠人肉翻两条 Injecting 日志的 body
+    大小猜断点在哪。现在直接对「上次命中的那条 entry」在本次请求里重新定位断点,报 STORED/
+    INCOMING 两端内容。entry/msg_hashes/messages 缺一即静默退回旧的纯数字告警(不崩、不误报),
+    覆盖 DepthRegressionWarning 组既有测试仍用的旧 2-参数调用形态。"""
+
+    def setUp(self):
+        server._inject_depth.clear()
+
+    def _mk_entry_and_drifted_request(self):
+        msgs = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+        entry = {"original_hashes": server._hash_messages(msgs[10:16]),
+                 "_debug_messages": msgs[10:16]}
+        request = list(msgs)
+        request[13] = {"role": "user", "content": "DRIFTED"}  # 链[3](msgs[13])处漂移
+        return entry, request
+
+    def test_reports_break_point_when_entry_and_context_given(self):
+        entry, request = self._mk_entry_and_drifted_request()
+        server._warn_depth_regression("sess-a", 16, entry=entry)
+        with self.assertLogs(server.log, level="WARNING") as cm:
+            server._warn_depth_regression("sess-a", 10, entry=None,
+                                           msg_hashes=server._hash_messages(request),
+                                           messages=request)
+        out = "\n".join(cm.output)
+        self.assertIn("depth regressed", out)
+        self.assertIn("matches 3/6", out)     # 链前 3 条匹配,断在 chain[3]
+        self.assertIn("request offset 10", out)
+        self.assertIn("m13", out)             # STORED 端原文
+        self.assertIn("DRIFTED", out)         # INCOMING 端原文
+
+    def test_falls_back_to_plain_message_without_entry(self):
+        server._warn_depth_regression("sess-b", 100)  # 旧调用形态:不传 entry
+        with self.assertLogs(server.log, level="WARNING") as cm:
+            server._warn_depth_regression("sess-b", 50)
+        out = "\n".join(cm.output)
+        self.assertIn("depth regressed", out)
+        self.assertNotIn("STORED", out)
+
+    def test_falls_back_when_chain_head_absent_from_current_request(self):
+        entry = {"original_hashes": server._hash_messages(
+                     [{"role": "user", "content": "elsewhere"}]),
+                 "_debug_messages": [{"role": "user", "content": "elsewhere"}]}
+        server._warn_depth_regression("sess-c", 100, entry=entry)
+        request = [{"role": "user", "content": "unrelated"}]
+        with self.assertLogs(server.log, level="WARNING") as cm:
+            server._warn_depth_regression("sess-c", 50, entry=None,
+                                           msg_hashes=server._hash_messages(request),
+                                           messages=request)
+        out = "\n".join(cm.output)
+        self.assertIn("depth regressed", out)
+        self.assertNotIn("STORED", out)
+
+
+class RememberRealUserIdWiring(unittest.TestCase):
+    """回归守卫(1.21.5 发布前修复):remember_real_user_id / _summary_user_id 是 compressor 的
+    模块级函数(配套模块级 _last_real_user_id),不是 RollingCompressor 实例方法。此前 server.py
+    误写成 `compressor.remember_real_user_id(...)`(compressor 在 server 里是实例),导致每个带
+    metadata 的真实请求一进来就 AttributeError、连接 reset——而这条路径当时无任何测试覆盖,带病
+    上线。以下四条钉死正确接线,杜绝同类实例前缀误用再溜过。"""
+
+    def setUp(self):
+        import compressor
+        self._saved = compressor._last_real_user_id
+
+    def tearDown(self):
+        import compressor
+        compressor._last_real_user_id = self._saved
+
+    def test_server_imports_module_level_helper(self):
+        # 崩溃点:server.py 必须把模块级函数 import 进来,按函数调用而非实例方法调。
+        self.assertTrue(callable(getattr(server, "remember_real_user_id", None)))
+
+    def test_instance_has_no_such_method(self):
+        # bug 本质:实例/类上根本没有该属性,任何 `compressor.remember_real_user_id` 必崩。
+        self.assertFalse(hasattr(server.RollingCompressor, "remember_real_user_id"))
+
+    def test_source_has_no_instance_prefixed_call(self):
+        # 源码守卫:防实例前缀误用复发(remember_real_user_id 与 _summary_user_id 都是模块级)。
+        with open(os.path.join(os.path.dirname(server.__file__), "server.py"),
+                  encoding="utf-8") as f:
+            src = f.read()
+        self.assertNotIn("compressor.remember_real_user_id", src)
+        self.assertNotIn("compressor._summary_user_id", src)
+
+    def test_remember_then_summary_reuses_real_value(self):
+        # 功能闭环:server 记住真实 user_id 后,回退摘要(client_meta 缺失)复用真值,不落兜底。
+        import compressor
+        compressor._last_real_user_id = None
+        server.remember_real_user_id("user_realdev_account__session_zzz")
+        self.assertEqual(compressor._last_real_user_id,
+                         "user_realdev_account__session_zzz")
+        self.assertEqual(compressor._summary_user_id(None),
+                         "user_realdev_account__session_zzz")
+
+
 class NoMatchSlidingDiagnostics(unittest.TestCase):
     """_log_no_match 滑窗部分匹配:此前按 0 偏移比对,对链在 raw 中部的增量子条目永远输出
     「diff at [0]」废话(7-9 排障实翻车)。现在要求报告最长部分匹配的断点及两端内容。"""
@@ -492,7 +589,7 @@ class BackgroundCompressionPublish(unittest.TestCase):
         compressed = [{"role": "user", "content": "SUMMARY"},
                       {"role": "assistant", "content": "ok"}] + src[4:]
         orig = server.compressor.compress
-        server.compressor.compress = lambda m, h, real_token_count=None: (compressed, 2)
+        server.compressor.compress = lambda m, h, real_token_count=None, client_meta=None: (compressed, 2)
         try:
             entry = {"pending": None, "pending_hashes": None}  # standalone; not in any store
             server._do_background_compression(entry, src, {}, real_token_count=100, sess="t")
@@ -575,7 +672,7 @@ class EmergencyReturn(unittest.TestCase):
         compressed = [{"role": "user", "content": "SUMMARY"},
                       {"role": "assistant", "content": "ok"}]
         orig = server.compressor.compress
-        server.compressor.compress = lambda m, h, real_token_count=None: (compressed, 2)
+        server.compressor.compress = lambda m, h, real_token_count=None, client_meta=None: (compressed, 2)
         try:
             msgs, entry = server._emergency_compress(src, {}, 5000, 1000)
             self.assertEqual(msgs, compressed)
@@ -588,7 +685,7 @@ class EmergencyReturn(unittest.TestCase):
 
     def test_nothing_to_compress_returns_none_none(self):
         orig = server.compressor.compress
-        server.compressor.compress = lambda m, h, real_token_count=None: ([], 0)
+        server.compressor.compress = lambda m, h, real_token_count=None, client_meta=None: ([], 0)
         try:
             msgs, entry = server._emergency_compress([{"role": "user", "content": "x"}], {}, None, 100)
             self.assertIsNone(msgs)
@@ -682,7 +779,7 @@ class EmergencyRetryEndToEnd(unittest.TestCase):
         self.fake = _FakeUpstream()
         server._upstream_conn = self.fake
         # stub the summarizer so emergency compression is offline + deterministic
-        server.compressor.compress = lambda m, h, real_token_count=None: (
+        server.compressor.compress = lambda m, h, real_token_count=None, client_meta=None: (
             [{"role": "user", "content": "[ROLLING_CONTEXT_SUMMARY] s"},
              {"role": "assistant", "content": "ok"}], 2)
         server.STORE_FILE = self._path
@@ -926,7 +1023,7 @@ class ProactiveCompressEndToEnd(unittest.TestCase):
                        server.CONTEXT_WINDOW_OVERRIDE)
         self.fake = _CapturingUpstream()
         server._upstream_conn = self.fake
-        server.compressor.compress = lambda m, h, real_token_count=None: (
+        server.compressor.compress = lambda m, h, real_token_count=None, client_meta=None: (
             [{"role": "user", "content": "[ROLLING_CONTEXT_SUMMARY] s"},
              {"role": "assistant", "content": "ok"}], 2)
         server.STORE_FILE = self._path
@@ -1164,6 +1261,41 @@ class DisguiseClient(unittest.TestCase):
         out = server._apply_disguise({"authorization": "Bearer CUR", "x-api-key": "K"})
         self.assertEqual(out["user-agent"], "claude-cli/1.0.83")
         self.assertEqual(out["authorization"], "Bearer CUR")
+
+    def test_apply_overrides_session_id_with_current(self):
+        # 模板带「上次大请求」的会话头,当次请求属另一会话 → 摘要头必须用当次会话(伪装形态仍来自模板)。
+        server.DISGUISE_CLIENT = True
+        server._disguise_template = {
+            "user-agent": "claude-cli/1.0.83",
+            "x-claude-code-session-id": "AAAAAAAA-old-session",
+        }
+        auth = {
+            "authorization": "Bearer CUR",
+            "x-claude-code-session-id": "BBBBBBBB-current-session",
+        }
+        out = server._apply_disguise(auth)
+        self.assertEqual(out["user-agent"], "claude-cli/1.0.83")
+        self.assertEqual(out["x-claude-code-session-id"], "BBBBBBBB-current-session")
+
+    def test_apply_session_id_override_no_duplicate_header(self):
+        # 模板键与当次键大小写不同,覆盖后只能剩一个会话头,否则上游可能取到旧会话值。
+        server.DISGUISE_CLIENT = True
+        server._disguise_template = {"X-Claude-Code-Session-Id": "AAAAAAAA-old"}
+        out = server._apply_disguise({"x-claude-code-session-id": "BBBBBBBB-cur"})
+        session_keys = [k for k in out if k.lower() == "x-claude-code-session-id"]
+        self.assertEqual(len(session_keys), 1)
+        self.assertEqual(out[session_keys[0]], "BBBBBBBB-cur")
+
+    def test_apply_drops_stale_session_id_when_current_absent(self):
+        # 模板带上次会话头,但当次请求【没带】session-id → 必须删掉,不能让摘要挂到上次会话名下。
+        server.DISGUISE_CLIENT = True
+        server._disguise_template = {
+            "user-agent": "claude-cli/1.0.83",
+            "x-claude-code-session-id": "AAAAAAAA-stale",
+        }
+        out = server._apply_disguise({"authorization": "Bearer CUR"})
+        self.assertEqual(out["user-agent"], "claude-cli/1.0.83")  # 伪装形态仍保留
+        self.assertNotIn("x-claude-code-session-id", {k.lower() for k in out})
 
 
 class DecideCompression(unittest.TestCase):

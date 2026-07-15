@@ -26,7 +26,7 @@ import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-from compressor import RollingCompressor, SUMMARY_MARKER
+from compressor import RollingCompressor, SUMMARY_MARKER, remember_real_user_id
 from stats import StatsCollector
 
 class FlushFileHandler(logging.handlers.RotatingFileHandler):
@@ -392,6 +392,35 @@ STORE_FILE = os.path.join(_CLAUDE_DIR, "rolling-context-store.json")
 STORE_MAX_ENTRIES = int(_cfg("store_max_entries", "ROLLING_CONTEXT_STORE_MAX", 40))
 
 
+def _diff_chain_break(entry: dict, msg_hashes: list, messages: list):
+    """给定一个压缩条目,在当前请求的 msg_hashes 里找它的哈希链能对上到第几位、从哪断裂。
+    对链头哈希在 msg_hashes 里的每个出现位置起数连续匹配长度,取最长的一次(1.21.4 修正:
+    按出现位置起数而非 0 偏移比对,增量子条目的链对应 raw 中部时才能报出真实断点而非「diff at [0]」
+    的废话)。返回 (matched_len, chain_len, offset, stored_msg, incoming_msg);链头哈希在 msg_hashes
+    里完全找不到时返回 None。_log_no_match(全场找最佳候选)与深度倒退取证(已知具体是哪一条条目
+    失配)共用这套「从链头逐位比对到断点」逻辑,避免两处重复维护。
+    """
+    oh = entry.get("original_hashes") or []
+    dbg = entry.get("_debug_messages")
+    if not oh or not dbg:
+        return None
+    best = None  # (matched_len, offset)
+    for off, h in enumerate(msg_hashes):
+        if h != oh[0]:
+            continue
+        n = 1
+        while n < len(oh) and off + n < len(msg_hashes) and msg_hashes[off + n] == oh[n]:
+            n += 1
+        if best is None or n > best[0]:
+            best = (n, off)
+    if best is None:
+        return None
+    n, off = best
+    stored = dbg[n] if n < len(dbg) else None
+    incoming = messages[off + n] if messages and off + n < len(messages) else None
+    return n, len(oh), off, stored, incoming
+
+
 class CompressionStore:
     """Content-based compression tracking. No sessions, no fingerprints, no keys.
 
@@ -492,38 +521,23 @@ class CompressionStore:
     def _log_no_match(self, msg_hashes: list, messages: list):
         """未命中诊断(debug 级,仅在整体无命中时调用一次):对每个存有原文的候选做滑窗部分
         匹配,报告最佳者的断裂点两端内容,定位「内容为何漂移」。已在 find_match 的锁内调用。
-
-        1.21.4 修正:此前按 0 偏移逐位比对——增量子条目的链对应 raw 中部,0 对齐必然输出
-        「diff at [0]」的废话(7-9 事故排障时真误导过)。现在从链首 hash 的每个出现位置起数
-        连续匹配长度,取全场最长者,报告链在第几条断、两端各是什么。"""
-        best = None  # (matched_len, entry, request_offset)
+        每条候选的比对逻辑见 `_diff_chain_break`(与深度倒退取证共用);这里只负责在候选间
+        取全场最长匹配并落 debug 日志。"""
+        best = None  # (matched_len, chain_len, offset, stored, incoming)
         for entry in self._compressions:
-            oh = entry.get("original_hashes") or []
-            dbg = entry.get("_debug_messages")
-            if not oh or not dbg:
-                continue
-            for off, h in enumerate(msg_hashes):
-                if h != oh[0]:
-                    continue
-                n = 1
-                while n < len(oh) and off + n < len(msg_hashes) and msg_hashes[off + n] == oh[n]:
-                    n += 1
-                if best is None or n > best[0]:
-                    best = (n, entry, off)
+            diag = _diff_chain_break(entry, msg_hashes, messages)
+            if diag is not None and (best is None or diag[0] > best[0]):
+                best = diag
         if best is None:
             log.debug(
                 f"[MATCH] No match among {len(self._compressions)} stored compression(s); "
                 f"no candidate's chain head appears in this request"
             )
             return
-        n, entry, off = best
-        oh = entry.get("original_hashes") or []
-        dbg = entry.get("_debug_messages") or []
-        stored = dbg[n] if n < len(dbg) else None
-        incoming = messages[off + n] if messages and off + n < len(messages) else None
+        n, chain_len, off, stored, incoming = best
         log.debug(
             f"[MATCH] No match among {len(self._compressions)} stored; best partial: "
-            f"{n}/{len(oh)} chain hashes matched at request offset {off}, breaks at chain[{n}] "
+            f"{n}/{chain_len} chain hashes matched at request offset {off}, breaks at chain[{n}] "
             f"(request[{off + n}]):\n"
             f"  STORED:   {str((stored or {}).get('content', ''))[:300]}\n"
             f"  INCOMING: {str((incoming or {}).get('content', ''))[:300]}"
@@ -677,23 +691,46 @@ class CompressionStore:
 
 store = CompressionStore()
 
-# 会话 → 上次注入替换深度(match_end)。同一会话消息只增,注入深度理应单调不减;
-# 倒退 = 更深的条目失配/被删,保留段暴涨(7-9 事故:8071 → 6019,裸露段 1.8M 超窗)。
-# 仅观测告警,不改行为。粗封顶防长驻泄漏:超上限直接清空重计(丢的只是告警基线)。
+# 会话 → (上次注入替换深度 match_end, 那次命中的条目引用)。同一会话消息只增,注入深度理应
+# 单调不减;倒退 = 更深的条目失配/被删,保留段暴涨(7-9 事故:8071 → 6019,裸露段 1.8M 超窗;
+# 7-15 事故:0-9831 退到 0-5621,同会话当天 ≥5 次)。保留 entry 引用(而非只存 int)是为了倒退发生
+# 时能现场取证——即便该条目此后被 reap/prune,`original_hashes`/`_debug_messages` 是创建期一次性
+# 写入、之后只读(见 _diff_chain_break),持有引用读取仍安全。仅观测告警,不改行为。
+# 粗封顶防长驻泄漏:超上限直接清空重计(丢的只是告警基线)。
 _inject_depth = {}
 _INJECT_DEPTH_MAX_SESSIONS = 256
 
 
-def _warn_depth_regression(sess: str, match_end: int):
+def _warn_depth_regression(sess: str, match_end: int, entry: dict = None,
+                            msg_hashes: list = None, messages: list = None):
+    """entry/msg_hashes/messages 为空(旧调用形态,现有单测覆盖)时只报深度数字,不做取证。
+    真实请求路径(server.py 注入分支)会传全,倒退时复用 `_diff_chain_break` 对「上次命中的那条
+    entry」在本次 msg_hashes 里重新定位断点,报告 stored/incoming 两端内容——不同于 _log_no_match
+    的「全场找最佳候选」,这里已经确定是哪一条,取证更直接、也不受 log level 门槛限制。"""
     if len(_inject_depth) > _INJECT_DEPTH_MAX_SESSIONS:
         _inject_depth.clear()
     prev = _inject_depth.get(sess)
-    if prev is not None and match_end < prev:
-        log.warning(
-            f"[MSG] Injection depth regressed: replaced 0-{prev} last time, only 0-{match_end} now "
-            f"— a deeper compression stopped matching (history drift?); retained tail grows accordingly"
-        )
-    _inject_depth[sess] = match_end
+    if prev is not None:
+        prev_end, prev_entry = prev
+        if match_end < prev_end:
+            diag = None
+            if prev_entry is not None and msg_hashes is not None and messages is not None:
+                diag = _diff_chain_break(prev_entry, msg_hashes, messages)
+            if diag is not None:
+                n, chain_len, off, stored, incoming = diag
+                log.warning(
+                    f"[MSG] Injection depth regressed: replaced 0-{prev_end} last time, only 0-{match_end} now "
+                    f"— a deeper compression stopped matching (history drift?); retained tail grows accordingly. "
+                    f"Its chain now matches {n}/{chain_len} hashes at request offset {off}, breaks at chain[{n}]:\n"
+                    f"  STORED:   {str((stored or {}).get('content', ''))[:300]}\n"
+                    f"  INCOMING: {str((incoming or {}).get('content', ''))[:300]}"
+                )
+            else:
+                log.warning(
+                    f"[MSG] Injection depth regressed: replaced 0-{prev_end} last time, only 0-{match_end} now "
+                    f"— a deeper compression stopped matching (history drift?); retained tail grows accordingly"
+                )
+    _inject_depth[sess] = (match_end, entry)
 
 # 请求级统计采集器:每个真实 /v1/messages 生成调用记一条(token + 各类耗时),
 # 内存环形缓冲 + JSONL 落盘,供 /stats 看板读取。
@@ -1020,8 +1057,8 @@ def get_passthrough_headers(req_headers: dict) -> dict:
 
 
 def _apply_disguise(auth_headers: dict) -> dict:
-    """代理自发请求(后台压缩 / emergency 兜底)用「最近大请求」的伪装头模板替换头,鉴权仍用当次请求的。
-    开关关或尚无模板时原样返回(安全回退到当次透传头,不破坏压缩)。"""
+    """代理自发请求(后台压缩 / emergency 兜底)用「最近大请求」的伪装头模板替换头,鉴权 + 会话头仍用
+    当次请求的。开关关或尚无模板时原样返回(安全回退到当次透传头,不破坏压缩)。"""
     if not DISGUISE_CLIENT:
         return auth_headers
     with _disguise_lock:
@@ -1029,9 +1066,20 @@ def _apply_disguise(auth_headers: dict) -> dict:
     if not tmpl:
         return auth_headers
     out = dict(tmpl)
-    for k, v in auth_headers.items():
-        if k.lower() in ("authorization", "x-api-key"):
-            out[k] = v
+    # 鉴权 + 会话头都必须来自当次真实请求,绝不用模板里那次大请求的:
+    #  · 模板经 _DISGUISE_SKIP 已排除 authorization/x-api-key,本就不含鉴权头,只会新增当次的;
+    #  · X-Claude-Code-Session-Id 不在 SKIP,模板【含】上次会话的值 → 必须用当次覆盖,且当次【没带】
+    #    时要删掉模板残留(宁可不带,也不能让摘要挂到别的会话名下)。body 的 metadata.user_id 已复用
+    #    当次真实,这里把请求头会话签名一并对齐。会话头非 claude_code_only 检测项,覆盖不削弱伪装。
+    auth_lower = {k.lower(): (k, v) for k, v in auth_headers.items()}
+    out_lower = {k.lower(): k for k in out}
+    for lk in ("authorization", "x-api-key", "x-claude-code-session-id"):
+        existing = out_lower.get(lk)   # 模板里的同名键(可能大小写不同)
+        if existing is not None:
+            out.pop(existing, None)    # 先清模板残留:防双头、防串上次会话
+        if lk in auth_lower:
+            k, v = auth_lower[lk]
+            out[k] = v                 # 当次带 → 用当次真实值;当次没带 → 保持已删(不带错)
     return out
 
 
@@ -1234,14 +1282,14 @@ def _mark_cache_breakpoint(msg: dict) -> bool:
     return False
 
 
-def _do_background_compression(entry: dict, messages: list, auth_headers: dict, real_token_count: int = None, sess: str = "--------"):
+def _do_background_compression(entry: dict, messages: list, auth_headers: dict, real_token_count: int = None, sess: str = "--------", client_meta=None):
     """Compress messages. Key = hashes of messages that were summarized (not kept verbatim)."""
     auth_headers = _apply_disguise(auth_headers)  # 套「最近大请求」伪装头模板(开关关/无模板则原样)
     # 后台线程不继承请求线程的会话标签,显式重设,使 [BG]/压缩器日志归属到发起会话。
     _set_sess(sess)
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
-        compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real_token_count)
+        compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real_token_count, client_meta=client_meta)
         # prefix_len==0 即直通(无可压旧消息):不要把原始消息误存为压缩条目(会生成垃圾 key 污染
         # 匹配)。直接移除本 entry 后返回。
         if prefix_len == 0:
@@ -1277,7 +1325,7 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
         store.remove(entry)
 
 
-def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg_chars: int):
+def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg_chars: int, client_meta=None):
     """同步压缩兜底:上游以「prompt too long」拒了超限请求后,当场把旧消息摘掉、只留近端,返回可直接
     发送的【完整新消息数组】。同时把这次压缩登记进 store(prefix + key 链),让后续请求直接命中、不必
     再付这次的同步延迟。压不出可压旧消息时返回 None(交由调用方原样回 400)。
@@ -1286,7 +1334,7 @@ def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg
     msg_chars/3 粗估兜底。"""
     real = reported_tokens or (msg_chars // 3 if msg_chars else None)
     auth_headers = _apply_disguise(auth_headers)  # 套「最近大请求」伪装头模板(开关关/无模板则原样)
-    compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real)
+    compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real, client_meta=client_meta)
     if prefix_len == 0:
         log.warning("[EMG] Nothing to compress (prefix_len=0); cannot shrink request")
         return None, None
@@ -1621,6 +1669,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         messages = payload.get("messages", [])
         is_streaming = payload.get("stream", False)
         model = payload.get("model", "unknown")
+        # 真实请求的 metadata（含 user_id）——透传给摘要请求，使其复用同会话的真实设备/会话标识。
+        _meta = payload.get("metadata")
+        client_meta = _meta if isinstance(_meta, dict) else None
+        if client_meta:
+            # 缓存最近真实 user_id：后续「自身无 metadata」的回退压缩仍能复用真值，不落一眼假的兜底。
+            # remember_real_user_id 是 compressor 模块级函数（配套模块级 _last_real_user_id），
+            # 不是 RollingCompressor 实例方法——必须按模块级函数调用，不能加 compressor. 实例前缀。
+            remember_real_user_id(client_meta.get("user_id"))
 
         # Hash all messages for content-based matching
         msg_hashes = _hash_messages(messages)
@@ -1705,7 +1761,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     payload["messages"] = merged
                     msg_chars = merged_chars
                     injected = True
-                    _warn_depth_regression(_get_sess(), match_end)  # 深度倒退观测(7-9 事故形态)
+                    # 深度倒退观测+取证(7-9/7-15 事故形态)
+                    _warn_depth_regression(_get_sess(), match_end, entry=match,
+                                            msg_hashes=msg_hashes, messages=messages)
                     # 该压缩条目第一次被注入 → 标记为「压缩生效的第一个请求」,并带上压缩前规模。
                     if not match.get("used"):
                         match["used"] = True
@@ -1757,7 +1815,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 # reported 传 body 粗估(比 msg_chars//3 更贴近真实,含 system+tools),供压缩器定 keep 比例。
                 new_msgs, proactive_entry = _emergency_compress(
-                    current_messages, auth_headers, est_tokens, msg_chars
+                    current_messages, auth_headers, est_tokens, msg_chars, client_meta=client_meta
                 )
             except Exception as ex:
                 log.error(f"[MSG] Proactive compression failed: {ex}", exc_info=True)
@@ -1834,7 +1892,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     )
                     new_msgs = None
                     try:
-                        new_msgs, emergency_entry = _emergency_compress(current_messages, auth_headers, reported, msg_chars)
+                        new_msgs, emergency_entry = _emergency_compress(current_messages, auth_headers, reported, msg_chars, client_meta=client_meta)
                     except Exception as ex:
                         log.error(f"[MSG] Emergency compression failed: {ex}", exc_info=True)
                     if new_msgs is not None:
@@ -2078,7 +2136,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),
-                        kwargs={"real_token_count": total_input, "sess": _get_sess()},
+                        kwargs={"real_token_count": total_input, "sess": _get_sess(), "client_meta": client_meta},
                         daemon=True,
                     )
                     t.start()

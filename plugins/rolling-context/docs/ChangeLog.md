@@ -1,5 +1,106 @@
 # ChangeLog
 
+## 1.21.6 — 切点不再落在漂移中的 tool_result+图片续片段上:根治「深度倒退」+ 告警补现场取证
+
+### 事故(2026-07-15,session 230062c0)
+同一会话当天反复出现「注入深度倒退」——已建立的深压缩条目突然失配,退回到浅得多的旧压缩,
+保留段暴涨,直接触发一场「连续压缩 + 上游 503」风暴(17:33 / 17:50~18:02 连续 12 次 / 18:57 /
+19:31,典型一例:19:14 注入深度 0-9831,19:31 退到 0-5621,保留段从 202 条暴涨到 4416 条 /
+5.19MB)。这不是 7-9 事故(1.21.4 已根治的「已建链事后漂移」)的重演,而是新的成因。
+
+### 根因链
+`promote_pending` 注释早有记录:CC 对「带附件(图片)的 tool_result」历史表示不稳定——80 秒内
+同一段内容,消息数可能在 1 条(图片内嵌 tool_result)与 2 条(tool_result 文本 + 紧随其后的纯
+图片续消息)之间漂移。旧的切点判定(`_find_keep_index` / `_select_cut` 两处扫描)把「干净边界」
+简化成「role=user 且无 tool_result」,但没检查「是否紧跟在另一条 user 消息之后」——这条纯图片
+续消息同样满足该条件,于是被误判成干净边界,新建压缩条目的切点/哈希链末位恰好落在这对疑似
+漂移的消息中间。该消息此后一旦改变分片形态(此时仍在 80 秒窗口内,大概率会变),已固化的哈希
+链末位就对不上,深度当场倒退回更浅的旧压缩(或父/祖先条目)。
+
+### 变更(compressor.py)
+新增 `_is_settled_user_turn(messages, i)`:除原有的「role=user 且无 tool_result」外,新增
+「前一条不是 user」——把整段疑似残片的连续 user 消息整体划给同一侧(要么全在压缩前,要么全在
+保留段),真正稳定的边界只会是「紧跟在 assistant 消息之后」的那条 user 消息。替换三处裸检查:
+`_find_keep_index` 的干净边界扫描、`_select_cut` 的前向 `clean_idx` 扫描、`_select_cut` 找不到
+干净/tool对边界时的后向兜底扫描。`toolpair_idx` 分支(assistant 紧跟 user)本身是角色切换点,
+天然稳定,未改动。
+
+### 变更(server.py)——深度倒退告警补现场取证
+`_warn_depth_regression` 此前只报「深度从 X 退到 Y」的数字,排障时得靠人肉翻两条 Injecting 日志
+对比 body 大小猜断点。抽出与 `_log_no_match` 共用的 `_diff_chain_break(entry, msg_hashes,
+messages)`:给定一个条目,在当前请求里重新定位其哈希链断在第几条、STORED/INCOMING 两端各是
+什么。`_inject_depth` 从「会话→深度」改成「会话→(深度, 命中条目引用)」,倒退时直接对「上次
+命中的那条 entry」取证(不同于 `_log_no_match` 的「全场找最佳候选」,这里已知具体是哪一条,
+取证更直接,且不受 debug 门槛限制,一律 WARNING 输出)。entry 的 `original_hashes`/
+`_debug_messages` 是创建期一次性写入、之后只读,即便该条目此后被 reap/prune,持有引用读取仍
+安全。`entry`/`msg_hashes`/`messages` 参数均可选,省略时静默退回旧的纯数字告警,不影响既有调用点。
+
+### 验证
+新增 8 测试:compressor.py 侧 SettledUserTurnBoundary ×5(`_is_settled_user_turn` 直接单测边界
+情形/接受首条;`_find_keep_index` 跳过漂移续片段;`_select_cut` 前向扫描 + 后向兜底两条路径均
+跳过漂移续片段,落到真正干净边界而非被安全封顶/裸检查卡死在续片段上);server.py 侧
+DepthRegressionForensics ×3(给足 entry/上下文时报出 STORED/INCOMING 断点;entry 缺失或链头在
+当前请求里完全找不到时静默退回旧纯数字告警,不崩)。三处 compressor 用例均先在修复前代码上
+验证会失败(`git stash` 反事实回放:2 个数值不符 + 2 个属性不存在),确认不是假阳性。
+discover 全量:150(1.21.4)→ 159(1.21.5,+9)→ 167(本版,+8)→ 172(同批次「发布前修复」新增
+RememberRealUserIdWiring,+4)。2026-07-15 现场复核:`python -m unittest discover -p "test_*.py"`
+→ Ran 172 tests, OK (skipped=1)。
+
+## 1.21.5 — 摘要请求复用真实会话身份:同会话同 device_id/session_id
+
+### 动机
+摘要(haiku)请求的 `metadata.user_id` 此前完全自造:`device_id` 进程级稳定,但 `session_id`
+**每次调用新 `uuid4()`**,`account_uuid` 空。结果上游/中转侧看到同一会话的每条摘要都来自「一个
+新会话」,与主请求(真实 `X-Claude-Code-Session-Id`)完全对不上,也无法按会话聚合观测。
+
+### 变更
+- **优先复用真实 user_id**:handler 从 `payload["metadata"]` 提取真实 `metadata`(仅当为 dict),
+  沿 `compress → _summarize_messages → _summarize_chunk` 透传(与 `auth_headers` 同一路径,新增
+  可选参数 `client_meta`)。真实请求带 `user_id`(CC 在同一会话内恒定)→ 摘要请求原样复用,
+  天然与主请求**同设备、同会话**,device_id/session_id/account_uuid 全为真实值。
+- **回退不再「一眼假」**:真实请求无有效 `metadata.user_id` 时,`_summary_user_id` 三级取值:
+  ① 当次 `client_meta.user_id` → ② 进程内缓存的最近一次真实 user_id(`remember_real_user_id`,与
+  `_disguise_template` 同构:**存真值、不猜格式**,回退仍带一个真的 CC user_id)→ ③ 自造兜底
+  `_CC_FALLBACK_USER_ID`。兜底格式从旧版 `json.dumps({...})`(一眼假)改为结构对齐的
+  `user_<64hex>_account__session_<uuid>`(account 段常为空,据观察对齐),device/session 进程稳定。
+  格式依据本机 `~/.claude.json` 真实 `userID`(64hex,正是首段)+ gateway 项目文档模板
+  `user_{hex}_account_{optional_uuid}_session_{uuid}` 三源一致;⚠️ 仍**非我方对真实 CC 请求的抓包
+  确证**(代理不落 body、运行时日志无完整样本)。真实/缓存真值永远优先,兜底仅进程启动后从未见过任何
+  真实 user_id 时触发(近乎不发生)。handler 每见到真实 metadata.user_id 即 `remember_real_user_id`。
+- 三个压缩入口(proactive / emergency / background thread)全部透传 `client_meta`;后台线程在
+  spawn 时捕获当次请求的 metadata,不受线程延迟影响。
+- **请求头的会话签名一并对齐**:`_apply_disguise` 此前只把 `authorization`/`x-api-key` 覆盖回当次
+  真实值,伪装模板里的 `X-Claude-Code-Session-Id` 属于「最近某个大请求」的会话,跨会话串味(默认
+  `DISGUISE_CLIENT=1` 下恒发生)。现把 `x-claude-code-session-id` 加入覆盖白名单,与 body 的
+  `metadata.user_id` 对称——同会话摘要的**请求头会话 ID = 主请求会话 ID**。覆盖做大小写无关去重,
+  防模板键与当次键大小写不同发出重复头(上游会取到旧会话值);**当次请求没带 session-id 时删掉模板
+  残留**(宁可不带,也不让摘要挂到上次会话名下)。会话头非 `claude_code_only` 检测项,覆盖不削弱伪装
+  形态(UA/x-app/x-stainless/anthropic-* 仍全来自模板)。
+
+### 取舍
+- 请求**体形态不变**:仍是 `metadata: {"user_id": <str>}`,只把 value 从「自造」换成「真实」,
+  不引入新字段,最小化上游 `claude_code_only` 检测的回归面。
+- 回退用进程级稳定 session_id(而非按会话缓存):真实 metadata 几乎恒在,回退极罕见,进程级稳定
+  已满足「同会话同标识」;严格按会话隔离的回退留待需要时再加(需把 sess tag 引入压缩器)。
+
+### 验证
+新增 9 测试:body 侧 SummaryUserIdentity ×6(复用当次真实 / 回退复用缓存真值 / 无缓存兜底非 JSON
+且结构仿真 / 兜底进程稳定 / 空·非 str·非 dict 一律回退 / `remember` 只收非空 str);header 侧
+DisguiseClient ×3(会话头覆盖回当次 / 大小写不同键去重 / 当次缺 session-id 时删模板残留)。同步更新
+5 个 emergency 测试桩签名(`compress` lambda 补 `client_meta`)。全套 **159 全绿**(150→159)。
+
+### 修复(发布前,2026-07-15:身份复用引入的致命崩溃)
+上面「优先复用真实 user_id」的 handler 改动把缓存调用写成了 `compressor.remember_real_user_id(...)`
+——但 `remember_real_user_id` 是 compressor 的**模块级**函数(配套模块级 `_last_real_user_id`),
+`server.py` 里 `compressor` 是 `RollingCompressor` **实例**,实例上没有该属性。于是每个带
+`metadata` 的真实请求(CC 请求全带)一进 `_handle_messages` 就 `AttributeError`、连接被 reset,
+外部 Claude Code「一改成走网关就对不了话」。该路径此前无任何单测覆盖、也未跑过真实请求,带病在
+本机跑起来直到暴露。修法:`server.py` 改为 `from compressor import ..., remember_real_user_id`
+并按模块级函数调用(去掉 `compressor.` 实例前缀)。补回归守卫 RememberRealUserIdWiring ×4:
+server 正确 import 模块级函数 / 实例上确无该属性 / 源码不含 `compressor.remember_real_user_id`
+(及 `_summary_user_id`)实例前缀 / `remember`→`_summary_user_id` 复用真值闭环。端到端复核:修复后
+真实请求穿过该点并转发上游(拿回上游结构化响应,不再 AttributeError)。
+
 ## 1.21.4 — 延迟 reap + 注入后体积复检:根治「深度倒退 → 1.8M 裸透 400 风暴」
 
 ### 事故(2026-07-09 19:41,session 230062c0,fable 1M 窗)

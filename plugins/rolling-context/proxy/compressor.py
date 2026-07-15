@@ -24,8 +24,45 @@ log = logging.getLogger("rolling-context.compressor")
 # 模拟 Claude Code 客户端：部分第三方中转网关的 claude_code_only 分组对 /v1/messages 严格校验
 # system 含 CC 特征 text block + metadata.user_id 为 CC 格式，否则判非 CC 客户端而拒绝。摘要请求
 # 是代理自造、非真实 CC 请求，故按官方形态补齐这两项以通过检测（头则透传真实请求的 UA/X-App/beta）。
+# metadata.user_id 优先【复用真实请求携带的 user_id】：CC 在同一会话内该值恒定，故摘要请求天然与主
+# 请求同设备、同会话（device_id/session_id 均为真实值）。仅当真实请求无 metadata 时才回退自造，且
+# 回退用的 session_id 亦进程级稳定（不再每次 uuid4），使回退路径下同进程/同会话摘要仍共享同一标识。
 _CC_SYSTEM_TEXT = "You are Claude Code, Anthropic's official CLI for Claude."
-_CC_DEVICE_ID = secrets.token_hex(32)  # 64 位 hex，进程内稳定
+_CC_DEVICE_ID = secrets.token_hex(32)  # 64 位 hex，进程内稳定（对齐真实 CC user_id 首段：~/.claude.json 的 userID 亦 64hex）
+_CC_SESSION_ID = str(uuid.uuid4())     # 兜底用，进程内稳定（复用真实/缓存 user_id 时不走这条）
+# 最终兜底 user_id：结构对齐 CC 真实格式 user_<64hex>_account_<可选uuid>_session_<uuid>，account 段
+# 常为空 → 采「空 account」形态 user_<64hex>_account__session_<uuid>，不再用旧版 json.dumps({...})
+# 那种「一眼假」形态。依据：本机 ~/.claude.json 真实 userID = 64hex(正是首段) + gateway 项目文档模板
+# user_{hex}_account_{optional_uuid}_session_{uuid}(示例 account 空)三源一致；仍【非我方对真实 CC
+# 请求的抓包确证】。真实/缓存真值永远优先(当次 client_meta > 进程内缓存)，此兜底仅进程启动后从未见过
+# 任何真实 user_id 时才触发(近乎不发生)。
+_CC_FALLBACK_USER_ID = f"user_{_CC_DEVICE_ID}_account__session_{_CC_SESSION_ID}"
+
+# 进程内缓存「最近一次见到的真实 CC user_id」：回退场景（当次请求自身无 metadata）复用它，使摘要
+# 请求仍带一个【真的】CC user_id（与 server._disguise_template 同构：存真值、不猜格式），而不是落到
+# 自造兜底。简单字符串 rebind/读取在 CPython 下原子，竞态最坏读到上一个真实值，无害，故不加锁。
+_last_real_user_id = None
+
+
+def remember_real_user_id(uid) -> None:
+    """记住最近一次真实请求携带的 user_id，供后续「自身无 metadata」的回退压缩复用（仅存非空字符串）。"""
+    global _last_real_user_id
+    if isinstance(uid, str) and uid:
+        _last_real_user_id = uid
+
+
+def _summary_user_id(client_meta) -> str:
+    """摘要请求 metadata.user_id 的取值，三级优先：
+    1) 当次真实请求的 user_id（client_meta.user_id，同会话恒定、全真实）；
+    2) 进程内缓存的最近一次真实 user_id（回退但仍是真值，不「一眼假」）；
+    3) 最终自造兜底 _CC_FALLBACK_USER_ID（进程稳定、结构仿真，近乎不触发）。"""
+    if isinstance(client_meta, dict):
+        uid = client_meta.get("user_id")
+        if isinstance(uid, str) and uid:
+            return uid
+    if _last_real_user_id:
+        return _last_real_user_id
+    return _CC_FALLBACK_USER_ID
 
 _default_summarizer_url = os.environ.get("ROLLING_CONTEXT_UPSTREAM") or "https://api.anthropic.com"
 SUMMARIZER_BASE_URL = os.environ.get("ROLLING_CONTEXT_SUMMARIZER_URL") or _default_summarizer_url
@@ -268,9 +305,8 @@ class RollingCompressor:
             msg_chars = self._count_chars([messages[i]])
             if accumulated + msg_chars > target_chars:
                 for j in range(i + 1, len(messages)):
-                    if messages[j].get("role") == "user":
-                        if not self._has_tool_result(messages[j]):
-                            return min(j, max_idx)
+                    if self._is_settled_user_turn(messages, j):
+                        return min(j, max_idx)
                 return min(i + 1, max_idx)
             accumulated += msg_chars
         return 0
@@ -282,6 +318,20 @@ class RollingCompressor:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     return True
         return False
+
+    def _is_settled_user_turn(self, messages: list, i: int) -> bool:
+        """messages[i] 是否是「稳定的干净 user 回合起点」:role=user、无 tool_result,且前一条
+        不是 user——避免把「tool_result+图片被 CC 拆成两条」时的图片续片段误判成干净边界而把
+        切点切在中间。CC 对带附件 tool_result 的历史表示不稳定(同一段内容,80 秒内消息数可能
+        1 条变 2 条、或反过来);这类续片段本身也满足「role=user 且无 tool_result」,若切点恰好
+        落在这里,该消息此后一旦改变分片形态,已固化的压缩哈希链末位就会失配,深度倒退回更浅的
+        旧压缩(7-15 事故:0-9831 退到 0-5621,同会话当天 ≥5 次)。要求「前一条不是 user」,把
+        整段疑似残片的连续 user 消息整体划给同一侧(要么全在压缩前,要么全在保留段),不切在
+        中间——真正稳定的边界只会是「紧跟在 assistant 消息之后」的那条 user 消息。"""
+        m = messages[i]
+        if m.get("role") != "user" or self._has_tool_result(m):
+            return False
+        return i == 0 or messages[i - 1].get("role") != "user"
 
     def _select_cut(self, messages: list, keep_ratio: float) -> tuple:
         """选择压缩切点,返回 (start_idx, keep_from_idx, prefix_len)。
@@ -310,7 +360,7 @@ class RollingCompressor:
         i = keep_from_idx
         while i < len(messages):
             m = messages[i]
-            if m.get("role") == "user" and not self._has_tool_result(m):
+            if self._is_settled_user_turn(messages, i):
                 clean_idx = i
                 break
             if (toolpair_idx is None and m.get("role") == "assistant"
@@ -326,9 +376,7 @@ class RollingCompressor:
             # 既无干净 user、又无可用 tool 对边界:向后回退到最近的干净 user 边界(1.7.13 行为),
             # 让摘要至少推进到上一次人类输入处。
             bwd = keep_from_idx - 1
-            while bwd > start_idx and (
-                messages[bwd].get("role") != "user" or self._has_tool_result(messages[bwd])
-            ):
+            while bwd > start_idx and not self._is_settled_user_turn(messages, bwd):
                 bwd -= 1
             keep_from_idx, prefix_len = bwd, 2
 
@@ -413,7 +461,7 @@ class RollingCompressor:
             chunks[-2].extend(chunks.pop())
         return chunks
 
-    def _summarize_chunk(self, conversation_text: str, existing_summary: str, auth_headers: dict) -> str:
+    def _summarize_chunk(self, conversation_text: str, existing_summary: str, auth_headers: dict, client_meta=None) -> str:
         """单次摘要调用:把 conversation_text(整段或分块中的一块)连同 existing_summary 一起送摘要器,
         返回新的滚动摘要文本。非 200 抛 RuntimeError。"""
         summary_max_tokens = 16000
@@ -432,15 +480,12 @@ class RollingCompressor:
             conversation=conversation_text,
         )
 
-        cc_user_id = json.dumps({
-            "device_id": _CC_DEVICE_ID, "account_uuid": "", "session_id": str(uuid.uuid4()),
-        })
         req_body = json.dumps({
             "model": self.summarizer_model,
             "max_tokens": summary_max_tokens,
-            # 模拟 Claude Code 客户端以通过上游 claude_code_only 检测。
+            # 模拟 Claude Code 客户端以通过上游 claude_code_only 检测；user_id 优先复用真实请求的。
             "system": [{"type": "text", "text": _CC_SYSTEM_TEXT}],
-            "metadata": {"user_id": cc_user_id},
+            "metadata": {"user_id": _summary_user_id(client_meta)},
             "messages": [{"role": "user", "content": prompt}],
         }).encode()
 
@@ -542,14 +587,14 @@ class RollingCompressor:
         except Exception:
             pass
 
-    def _summarize_messages(self, msgs: list, existing_summary: str, auth_headers: dict, _depth: int = 0) -> str:
+    def _summarize_messages(self, msgs: list, existing_summary: str, auth_headers: dict, _depth: int = 0, client_meta=None) -> str:
         """把一组消息摘成滚动摘要;若摘要器仍以 "prompt is too long" 拒绝(分块预算估偏、既有摘要偏大、
         内容 token 密度偏高等),就把消息二分递归续摘——上半段先摘,结果作为下半段的 existing_summary。
         单条消息在 _messages_to_text 里已截到 ~4KB,递归到单条必然能塞下,故一定收敛。
         作用:任何单块超限都能自愈,不再让「一块 400」把整次压缩拖垮(旧版的主要失败模式)。"""
         text = self._messages_to_text(msgs)
         try:
-            return self._summarize_chunk(text, existing_summary, auth_headers)
+            return self._summarize_chunk(text, existing_summary, auth_headers, client_meta)
         except RuntimeError as e:
             too_long = "too long" in str(e).lower()
             if too_long and len(msgs) > 1 and _depth < 16:
@@ -558,12 +603,12 @@ class RollingCompressor:
                     f"  summarizer rejected {len(text):,} chars / {len(msgs)} msgs as too long; "
                     f"splitting {mid}+{len(msgs) - mid} and retrying (depth {_depth + 1})"
                 )
-                rolling = self._summarize_messages(msgs[:mid], existing_summary, auth_headers, _depth + 1)
-                rolling = self._summarize_messages(msgs[mid:], rolling, auth_headers, _depth + 1)
+                rolling = self._summarize_messages(msgs[:mid], existing_summary, auth_headers, _depth + 1, client_meta)
+                rolling = self._summarize_messages(msgs[mid:], rolling, auth_headers, _depth + 1, client_meta)
                 return rolling
             raise
 
-    def compress(self, messages: list, auth_headers: dict, real_token_count: int = None) -> tuple:
+    def compress(self, messages: list, auth_headers: dict, real_token_count: int = None, client_meta=None) -> tuple:
         """Compress messages using rolling summarization (synchronous)."""
         # Use real API token count to determine what fraction of content to keep
         if real_token_count and real_token_count > 0:
@@ -605,7 +650,7 @@ class RollingCompressor:
         )
         rolling = existing_summary
         for ci, chunk in enumerate(chunks, 1):
-            rolling = self._summarize_messages(chunk, rolling, auth_headers)
+            rolling = self._summarize_messages(chunk, rolling, auth_headers, client_meta=client_meta)
             log.info(
                 f"  chunk {ci}/{len(chunks)}: {len(chunk)} msgs -> "
                 f"rolling summary {len(rolling):,} chars"
