@@ -906,10 +906,12 @@ class EffectiveTrigger(unittest.TestCase):
 
 
 class ProactiveGate(unittest.TestCase):
-    """_should_proactive_compress = 开关开 + 非 count +(未注入超 trigger | 已注入仍超窗)。
+    """_should_proactive_compress = 开关开 + 非 count +(未注入超 trigger | 已注入仍超硬顶)。
     body 粗估偏低估,故据此判超是保守的(只在请求确实很大时触发)。
     1.21.4 起返回 (should_sync, reason) 元组;injected 不再无条件放行——注入深度倒退后
-    保留段仍可超窗(7-9 事故 1.8M),est 超窗就同步重压。"""
+    保留段仍可超窗(7-9 事故 1.8M),est 超限就同步重压。
+    1.21.7 起注入复检阈值从模型窗口收紧到 hard_ceiling(7-17 事故:est ~60 万 < 1M 窗
+    被放行,上游实吃 85 万 token 触发安全护栏 + CC 端 compact)。"""
 
     def setUp(self):
         self._saved = (server.PROACTIVE_COMPRESS, server.TRIGGER_TOKENS, server.CONTEXT_WINDOW_OVERRIDE)
@@ -937,17 +939,25 @@ class ProactiveGate(unittest.TestCase):
         should, _ = server._should_proactive_compress(10_000_000, {}, True, False)
         self.assertFalse(should)
 
-    def test_injected_within_window_forwards(self):
-        # 已注入且注入结果在窗口内(200k 窗,700000//4=175k < 200k)→ 放行,不再主动压
+    def test_injected_within_ceiling_forwards(self):
+        # 已注入且注入结果在硬顶内(200k 窗、trigger 160k → ceiling min(192k, 190k)=190k;
+        # 700000//4=175k < 190k)→ 放行,不再主动压
         should, reason = server._should_proactive_compress(700_000, {}, False, True)
         self.assertFalse(should)
         self.assertEqual(reason, "cache-hit")
 
-    def test_injected_still_over_window_syncs(self):
-        # 7-9 事故形态:注入深度倒退,est 仍超模型窗口(200k 窗,10M//4=2.5M)→ 同步重压不放行
+    def test_injected_over_ceiling_syncs(self):
+        # 7-9/7-17 事故形态:注入深度倒退,est 超 hard_ceiling(190k;10M//4=2.5M)→ 同步重压不放行
         should, reason = server._should_proactive_compress(10_000_000, {}, False, True)
         self.assertTrue(should)
-        self.assertEqual(reason, "injected-over-window")
+        self.assertEqual(reason, "injected-over-ceiling")
+
+    def test_injected_between_ceiling_and_window_syncs(self):
+        # 1.21.7 收紧点:est 在 ceiling 与窗口之间(190k < 780000//4=195k < 200k 窗)——
+        # 旧口径(窗口阈值)会放行裸透,新口径同步重压。7-17 事故正是这一档(60 万 < 1M 窗)。
+        should, reason = server._should_proactive_compress(780_000, {}, False, True)
+        self.assertTrue(should)
+        self.assertEqual(reason, "injected-over-ceiling")
 
     def test_no_fire_when_disabled(self):
         server.PROACTIVE_COMPRESS = False
@@ -1312,21 +1322,36 @@ class DecideCompression(unittest.TestCase):
                                                    is_count=True), ("forward", "count-probe"))
 
     def test_pre_cache_hit(self):
-        # 注入且未超窗(或未知窗口)→ 放行。window=0(未知)时保守放行,维持 1.21.3 前行为。
+        # 注入且未超限(或未知窗口)→ 放行。window=0 且未传 ceiling(未知)时保守放行,
+        # 维持 1.21.3 前行为。
         self.assertEqual(server.decide_compression("pre", est_tokens=999_999, eff_trigger=180_000,
                                                    injected=True), ("forward", "cache-hit"))
 
-    def test_pre_injected_within_window_forwards(self):
+    def test_pre_injected_within_ceiling_forwards(self):
+        # 正常注入形态:est 远低于 hard_ceiling → 放行
+        self.assertEqual(server.decide_compression("pre", est_tokens=130_000, eff_trigger=180_000,
+                                                   hard_ceiling=216_000, window=1_000_000,
+                                                   injected=True),
+                         ("forward", "cache-hit"))
+
+    def test_pre_injected_over_ceiling_syncs(self):
+        # 7-17 事故形态:注入深度倒退后保留段 est ~74 万,低于 1M 窗但远超 hard_ceiling——
+        # 旧口径(窗口阈值)放行裸透,上游实吃 85 万 token 并触发安全护栏 + CC 端 compact。
+        # 1.21.7 起超 ceiling 即同步重压,与 post 侧饥饿逃生同一条线。
+        self.assertEqual(server.decide_compression("pre", est_tokens=740_000, eff_trigger=180_000,
+                                                   hard_ceiling=216_000, window=1_000_000,
+                                                   injected=True),
+                         ("sync", "injected-over-ceiling"))
+
+    def test_pre_injected_no_ceiling_falls_back_to_window(self):
+        # 未传 hard_ceiling(旧调用)时回退窗口阈值:740k < 1M 窗 → 放行;
+        # 1.8M > 1M 窗 → 同步重压(7-9 事故,「注入 = known-good 尺寸」假设的矩阵化否定)。
         self.assertEqual(server.decide_compression("pre", est_tokens=740_000, eff_trigger=180_000,
                                                    window=1_000_000, injected=True),
                          ("forward", "cache-hit"))
-
-    def test_pre_injected_over_window_syncs(self):
-        # 7-9 事故:注入深度倒退(命中更浅旧条目),保留段 est 1.8M > 1M 窗 → 原样转发必 400,
-        # 必须当场同步重压。「注入 = known-good 尺寸」假设的矩阵化否定。
         self.assertEqual(server.decide_compression("pre", est_tokens=1_806_356, eff_trigger=180_000,
                                                    window=1_000_000, injected=True),
-                         ("sync", "injected-over-window"))
+                         ("sync", "injected-over-ceiling"))
 
     def test_pre_not_injected_ignores_window(self):
         # 未注入路径不受 window 参数影响:超 trigger 就 sync(原语义不变)

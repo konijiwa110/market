@@ -1,5 +1,40 @@
 # ChangeLog
 
+## 1.21.7 — 注入后体积复检阈值从模型窗口收紧到 hard_ceiling:深度倒退的膨胀请求不再裸透上游
+
+### 事故(2026-07-17 20:05,session 02b07a4f)
+502 重试时 CC 批量改写历史(消息数 3757→3536、图片占位符重编号),深压缩条目(0-3648)哈希链
+断裂,注入回退到浅条目(0-2462),保留段 1074 条 ≈ 1.14M 字符。代理已打出深度倒退告警,却仍
+原样转发 5.26MB:上游实吃 85.2 万 token(全额计费),巨型请求触发 Fable 5 安全护栏、CC 切换
+Opus 4.8;CC 端上下文表从 13 万瞬跳 66 万、越过 auto-compact 线(400K×85%),客户端 compact
+把整段历史换掉——网关 106 秒后完成的自愈压缩(852K→40K)登记即作废,永远匹配不上新历史。
+
+### 已核实无辜的部分
+响应后的防重复闸门与 hard_ceiling 饥饿逃生全程工作正常:20:05:41 越过硬顶正确放行紧急重压,
+20:05:58 的 "skipping redundant compression" 是对同一在途压缩的正当去重(claim 命中 pending
+条目),不是漏压。此前怀疑「闸门拦住自愈」经日志核实不成立,该路径未改动。
+
+### 根因与变更(server.py)
+1.21.4 加的「注入后体积复检」(`decide_compression` pre/injected 分支)阈值是模型窗口——
+7-9 事故的倒退形态是 est 1.8M 超 1M 窗,窗口阈值够用;本次倒退后 est 约 60 万 token,低于
+1M 窗被判 "cache-hit" 放行。而只要裸透一次,计费/安全护栏/客户端 compact 三连即成事实,
+后台自愈再快也来不及。修法:阈值从 `window` 收紧到 `hard_ceiling`(min(1.2×trigger,
+0.95×window),与 post 侧饥饿逃生同一条线),语义统一为「超过这条线,任何状态都立即压缩」;
+超限走既有 `_emergency_compress` 同步重压(复用旧摘要续写、结果当场登记 store)。
+`_should_proactive_compress` 组装层补传 `hard_ceiling`;未传 ceiling 的旧调用回退窗口阈值,
+window=0(未知)时保守放行语义不变。reason 码 `injected-over-window` → `injected-over-ceiling`,
+调用点告警同步改为打印 ceiling/window 并标注疑似深度倒退。
+
+### 代价(有意的取舍)
+触发时该请求前台同步压缩、可卡 1~2 分钟(事故量级 985 条消息实测 106 秒)——用一次可见卡顿
+换掉 85 万 token 账单 + 安全护栏 + 客户端 compact 会话重置。正常注入 est ~10 万,离 216K 硬顶
+一倍余量,不误触;压缩失败 catch 后原样转发,回退为旧行为。
+
+### 验证
+测试 172→174:新增 ProactiveGate「est 介于 ceiling 与窗口之间(旧口径放行、新口径重压)」
+(7-17 事故档位)与 DecideCompression「未传 ceiling 回退窗口阈值」;既有 injected 用例改按
+ceiling 口径断言。全量 174 绿(skip 1 为既有跳过)。
+
 ## 1.21.6 — 切点不再落在漂移中的 tool_result+图片续片段上:根治「深度倒退」+ 告警补现场取证
 
 ### 事故(2026-07-15,session 230062c0)

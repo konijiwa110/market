@@ -1170,7 +1170,7 @@ def decide_compression(
     可以穷举单测,新增条件必须先过矩阵。
 
     stage="pre"(转发前,基于图片修正后的粗估):
-        "sync"    — 同步压缩再转发(resume 冷启动大请求,先压后发)
+        "sync"    — 同步压缩再转发(resume 冷启动大请求,或注入后仍超 hard_ceiling 的深度倒退)
         "forward" — 原样转发
     stage="post"(响应后,基于上游回报的真实 token):
         "bg"      — 起后台压缩(干净 end_turn 边界,或超硬顶的饥饿逃生)
@@ -1188,10 +1188,13 @@ def decide_compression(
         if injected:
             # 注入后体积复检(1.21.4):「注入 = known-good 尺寸」的假设被 7-9 事故打破——
             # 注入深度倒退(命中了更浅的旧条目)时,保留段可达 1.8M tokens,原样转发必 400。
-            # 注入结果估算仍超模型窗口就同步重压,不放行;窗口内则维持 cache-hit 放行
-            # (正常注入远小于窗口,不会误触发这条昂贵路径)。
-            if window and est_tokens > window:
-                return "sync", "injected-over-window"
+            # 1.21.7 把阈值从模型窗口收紧到 hard_ceiling(与 post 侧饥饿逃生同一条线):
+            # 7-17 事故里 CC 批量改写历史致深链断裂,倒退后保留段 est ~60 万 < 1M 窗被放行,
+            # 上游实吃 85 万 token 并触发安全护栏改路由 + CC 端上下文表爆表引发客户端 compact。
+            # 未传 hard_ceiling(旧调用/window=0 未知)时回退旧的窗口阈值,保守放行语义不变。
+            limit = hard_ceiling or window
+            if limit and est_tokens > limit:
+                return "sync", "injected-over-ceiling"
             return "forward", "cache-hit"
         if est_tokens > eff_trigger:
             return "sync", "over-trigger"
@@ -1211,12 +1214,15 @@ def decide_compression(
 
 def _should_proactive_compress(raw_body_len: int, req_headers: dict, is_count: bool, injected: bool):
     """转发前判定的组装层:算粗估与有效 trigger,决策本体走 decide_compression 决策表。
-    返回 (should_sync, reason)——reason 供调用点区分「冷启动超 trigger」与「注入后仍超窗」日志。"""
+    返回 (should_sync, reason)——reason 供调用点区分「冷启动超 trigger」与「注入后仍超顶」日志。"""
+    eff_trigger = _effective_trigger(req_headers)
+    window = _request_window(req_headers)
     action, reason = decide_compression(
         "pre",
         est_tokens=_estimate_body_tokens(raw_body_len),
-        eff_trigger=_effective_trigger(req_headers),
-        window=_request_window(req_headers),
+        eff_trigger=eff_trigger,
+        hard_ceiling=_hard_ceiling(eff_trigger, window),
+        window=window,
         injected=injected,
         is_count=is_count,
         proactive_enabled=PROACTIVE_COMPRESS,
@@ -1798,12 +1804,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         should_sync, pre_reason = _should_proactive_compress(body_est_len, req_headers, is_count, injected)
         if should_sync:
             est_tokens = _estimate_body_tokens(body_est_len)
-            if pre_reason == "injected-over-window":
-                # 注入命中但结果仍超窗(深度倒退/条目过浅):原样转发必 400,当场同步重压。
+            if pre_reason == "injected-over-ceiling":
+                # 注入命中但结果仍超硬顶(深度倒退/条目过浅):裸透一次就是全额计费 + 触发
+                # 安全护栏 + CC 端上下文表爆表引发客户端 compact(7-17 事故),当场同步重压。
+                _et = _effective_trigger(req_headers)
+                _win = _request_window(req_headers)
                 log.warning(
-                    f"[MSG] Injected result still over window: ~{est_tokens:,} est tokens "
+                    f"[MSG] Injected result still over hard ceiling: ~{est_tokens:,} est tokens "
                     f"(body {len(body):,} B, est-adjusted {body_est_len:,} B) "
-                    f"> window {_request_window(req_headers):,} — sync compressing before forward"
+                    f"> ceiling {_hard_ceiling(_et, _win):,} (window {_win:,}) — "
+                    f"depth regression suspected, sync compressing before forward"
                 )
             else:
                 log.info(
