@@ -1,5 +1,75 @@
 # ChangeLog
 
+## 1.21.8 — upstream/apikey 优先级改为「settings.json > OS 环境变量 > rolling-context.json」,且每请求现读、不做进程级缓存
+
+### 动机
+代理靠 hook 的版本闸门常驻数天不重启。但此前 `server.py` 的 `UPSTREAM_URL`/`APIKEY` 是**模块级
+常量,只在进程启动那一刻算一次**,且优先级是 `rolling-context.json > 环境变量`。用户改
+`settings.json` 的 `ANTHROPIC_BASE_URL`,或换了鉴权/切换上游服务商,只要代理没重启,代理永远
+看不到这次变更——请求继续发到旧 upstream、带着不匹配的 apikey,直接失败,且不重启代理无法自愈。
+
+深挖后发现是两层叠加的问题:
+1. `server.py` 里 `upstream`/`apikey` 的解析优先级本身反了(config 权重最高),且是进程启动时
+   算一次的冻结常量。
+2. Windows 下实际生效的 hook 脚本 `start-proxy.ps1`(`hooks.json` 里 `.ps1` 优先于 `.sh`)在
+   `rolling-context.json` 配了 `upstream` 时,只把 `ANTHROPIC_BASE_URL` 强制覆盖回本地代理地址,
+   从不把它「链」进 `ROLLING_CONTEXT_UPSTREAM` 保存——用户手改 `settings.json` 的
+   `ANTHROPIC_BASE_URL` 后,下一次 SessionStart 这次改动就被直接冲掉,连活到 server.py 读取那一刻
+   的机会都没有。只修一层不够,两层必须一起改。
+
+### 范围界定
+核查 `~/.claude/settings.json` 发现残留 `ROLLING_CONTEXT_TRIGGER=200000`/
+`ROLLING_CONTEXT_TARGET=60000`,与 `rolling-context.json` 里用户主动调过的 `trigger=180000`/
+`target=40000`(配合 `trigger_ratio`/`target_ratio` 比例模式)不一致——多半是旧版 hook 写过的
+默认值残留。若把配置优先级整体反转,`TRIGGER_TOKENS`/`TARGET_TOKENS` 会静默变回这两个陈旧默认
+值,是一次看不见的行为回归。故本次只反转 `upstream` 与 `apikey` 这两个「路由/鉴权」项;
+`port`/`host`/`trigger`/`target`/`model`/`context_window`/`emergency_compress`/
+`proactive_compress`/`disguise_client`/`archive*` 继续走原来的 `_cfg`(config > env,进程启动时
+读一次),不受影响。
+
+### 变更(server.py)
+新增 `_read_settings_env()`(现读 `~/.claude/settings.json` 的 `env` 块,utf-8-sig 容忍 BOM,
+不缓存)与 `_resolve_routing()`(现读 `rolling-context.json` + `settings.json`,不做进程级缓存,
+优先级:settings.json env 块 > OS 环境变量 > rolling-context.json(兜底默认配置)> 内置默认,
+返回 `(upstream_url, apikey)`)。settings.json 排最前:它是 hook 每次 SessionStart 都会刷新的
+「活的」配置,用户改了立刻生效。OS 环境变量排第二(压过 rolling-context.json,但压不过
+settings.json):用户直接在 shell/系统层面设的值应当能覆盖配置文件里的兜底默认配置,但如果
+settings.json 里也写了(多半是 hook 刚链过的用户手改值),那个更新、更贴近用户此刻意图,优先
+生效。删除模块级 `UPSTREAM_URL`/`_load_upstream()`/`APIKEY` 常量。`_upstream_conn`/
+`_apply_apikey`/`_forward_headers` 加形参改用调用方现取的值。`_proxy_raw`/`_handle_messages`
+在函数开头调一次 `_resolve_routing()`,同一发请求(含 emergency 重试)复用同一份解析结果,
+避免中途上游漂移。`_do_background_compression`/`_emergency_compress` 在压缩前现取并写入
+`compressor.summarizer_url`/`summarizer_api_key`(普通实例属性,调用时才读,无需改
+compressor.py)。`/health`、`/stats`、启动 banner 同步改用现取值,让诊断端点反映此刻真实生效
+的上游,而非启动时的快照。
+
+### 变更(hooks/start-proxy.ps1、start-proxy.sh)
+「链上游」逻辑移出 `$HasConfigUpstream`/`has_cfg_upstream` 分支判断:无论是否配了 config
+upstream,只要当前 `ANTHROPIC_BASE_URL` 不是指向本地代理自己,都先把它存进
+`ROLLING_CONTEXT_UPSTREAM`(写进 settings.json 的 env 块),再覆盖成代理地址——配合 server.py
+新的「settings.json 优先」顺序,用户手改 `settings.json` 的效果就能在下一次请求生效,不会被这
+一步悄悄吞掉。`setdefault` 四个调优默认值(`ROLLING_CONTEXT_TRIGGER`/`TARGET`/`MODEL`/`PORT`)
+继续只在无 config upstream 时写,不在本次改动范围内。两脚本同构修改,并用四组场景(无手改/
+手改+有config/无config手改/自指向代理)做语义 dry-run 验证。
+
+### 负面影响(如实评估)
+- 每次请求多两次小文件 I/O(几百字节,常驻 OS 页缓存),相对网络转发/哈希/压缩决策量级可忽略,
+  不做 mtime 缓存这类额外复杂度。
+- OS 级环境变量本质仍是进程启动时的快照,这是操作系统限制:真正「编辑后立即生效」依赖的是
+  `settings.json`/`rolling-context.json` 这两个文件被现读,而不是 `os.environ`。
+- `compressor.summarizer_url`/`summarizer_api_key` 是共享单例的实例属性,后台压缩线程与同步
+  emergency 压缩线程并发时理论上存在「调用前一刻被另一线程改写」的竞态——影响面仅限于压缩器
+  自己发起的摘要请求用错一次性 upstream/apikey,大概率直接连接失败被现有 try/except 整段兜底
+  吞掉,不会 corrupt 数据,只是那一次压缩尝试失败、下次请求自愈。
+
+### 验证
+语法:`python -m py_compile server.py`,`bash -n start-proxy.sh`,pwsh Parser 对 `start-proxy.ps1`
+做纯解析(不执行)。新增 `ResolveRoutingPriority` 测试类 9 例:settings.json env 块 > OS 环境变量
+> rolling-context.json > 内置默认四层逐一覆盖(含「OS 环境变量压过 config」「settings.json 压过
+OS 环境变量 + config」两个关键用例)、自指向 URL 不回指自己、现读不缓存(改文件后两次调用返回
+不同结果);修复 3 处 `_upstream_conn` fake 的签名(新加 `parsed` 形参)。discover 全量
+174→183(+9),`python -m unittest discover -p "test_*.py"` → OK(skip 1,与本次改动无关)。
+
 ## 1.21.7 — 注入后体积复检阈值从模型窗口收紧到 hard_ceiling:深度倒退的膨胀请求不再裸透上游
 
 ### 事故(2026-07-17 20:05,session 02b07a4f)

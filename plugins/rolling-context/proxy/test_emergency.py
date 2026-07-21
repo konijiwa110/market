@@ -748,7 +748,7 @@ class _FakeUpstream:
     def __init__(self):
         self.calls = 0
 
-    def __call__(self):
+    def __call__(self, parsed):
         return _FakeConn(self)
 
 
@@ -1017,7 +1017,7 @@ class _CapturingUpstream:
         self.calls = 0
         self.last_body = None
 
-    def __call__(self):
+    def __call__(self, parsed):
         return _CapturingConn(self)
 
 
@@ -1109,7 +1109,7 @@ class _MidFlightSeedUpstream:
         self.calls = 0
         self.seed = seed
 
-    def __call__(self):
+    def __call__(self, parsed):
         return _MidFlightSeedConn(self)
 
 
@@ -1450,6 +1450,129 @@ class HashResumeImmunity(unittest.TestCase):
         d = {"role": "assistant", "content": [
             {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "rm"}}]}
         self.assertNotEqual(server._hash_message(c), server._hash_message(d))
+
+
+class ResolveRoutingPriority(unittest.TestCase):
+    """_resolve_routing 优先级矩阵(1.21.8):settings.json env 块 > OS 环境变量 >
+    rolling-context.json(兜底默认配置)> 内置默认;且每次调用现读两个文件,不做进程级缓存。"""
+
+    SETTINGS_PATH = os.path.join(_TMP, ".claude", "settings.json")
+    CONFIG_PATH = os.path.join(_TMP, ".claude", "rolling-context.json")
+
+    def setUp(self):
+        # 兄弟测试文件(test_injection_safety.py/test_replay.py 等)在各自模块导入时也会把
+        # HOME/USERPROFILE 指到它们自己的临时目录;discover 模式下全部模块先导入完才开始跑
+        # 测试,谁的模块级赋值最后执行、谁就赢——与本文件顶部设的 _TMP 不是同一个目录。
+        # _resolve_routing 是本仓库第一个「调用时才现读 expanduser('~')」的函数,必须在每个
+        # 用例开始前把 HOME/USERPROFILE 重新钉回本文件的 _TMP,结束后再还原,防止被吃掉。
+        self._saved_home_env = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+        os.environ["HOME"] = _TMP
+        os.environ["USERPROFILE"] = _TMP
+        self._saved_env = {
+            k: os.environ.pop(k, None)
+            for k in ("ROLLING_CONTEXT_UPSTREAM", "ROLLING_CONTEXT_APIKEY")
+        }
+        for p in (self.SETTINGS_PATH, self.CONFIG_PATH):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def tearDown(self):
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for k, v in self._saved_home_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for p in (self.SETTINGS_PATH, self.CONFIG_PATH):
+            if os.path.exists(p):
+                os.remove(p)
+
+    def _write_settings(self, env: dict):
+        with open(self.SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"env": env}, f)
+
+    def _write_config(self, cfg: dict):
+        with open(self.CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+
+    def test_default_when_nothing_configured(self):
+        up, key = server._resolve_routing()
+        self.assertEqual(up, "https://api.anthropic.com")
+        self.assertEqual(key, "")
+
+    def test_config_is_fallback_when_nothing_else_set(self):
+        self._write_config({"upstream": "https://config.example", "apikey": "cfg-key"})
+        up, key = server._resolve_routing()
+        self.assertEqual(up, "https://config.example")
+        self.assertEqual(key, "cfg-key")
+
+    def test_settings_env_beats_config(self):
+        self._write_config({"upstream": "https://config.example", "apikey": "cfg-key"})
+        self._write_settings({
+            "ROLLING_CONTEXT_UPSTREAM": "https://settings.example",
+            "ROLLING_CONTEXT_APIKEY": "settings-key",
+        })
+        up, key = server._resolve_routing()
+        self.assertEqual(up, "https://settings.example")
+        self.assertEqual(key, "settings-key")
+
+    def test_settings_anthropic_base_url_fallback_beats_config(self):
+        # 没显式配 ROLLING_CONTEXT_UPSTREAM 时,settings.json 里 claude 自己的 ANTHROPIC_BASE_URL
+        # 也要盖过 rolling-context.json——否则用户只改 baseURL(不知道还有 ROLLING_CONTEXT_UPSTREAM
+        # 这个专用键)时,配置文件里的旧上游会继续裸赢。
+        self._write_config({"upstream": "https://config.example"})
+        self._write_settings({"ANTHROPIC_BASE_URL": "https://claude-base.example"})
+        up, _ = server._resolve_routing()
+        self.assertEqual(up, "https://claude-base.example")
+
+    def test_self_referencing_base_url_is_ignored(self):
+        # ANTHROPIC_BASE_URL 已经被 hook 覆写指向代理自己时,不能把自己当成「上游」,否则死循环。
+        self._write_config({"upstream": "https://config.example"})
+        self._write_settings({"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{server.LISTEN_PORT}"})
+        up, _ = server._resolve_routing()
+        self.assertEqual(up, "https://config.example")
+
+    def test_os_env_var_beats_config(self):
+        # OS 环境变量排在 rolling-context.json 之上(但仍低于 settings.json)——用户直接在
+        # shell/系统层面设的值,应当能覆盖配置文件里的兜底默认配置。
+        self._write_config({"upstream": "https://config.example", "apikey": "cfg-key"})
+        os.environ["ROLLING_CONTEXT_UPSTREAM"] = "https://env.example"
+        os.environ["ROLLING_CONTEXT_APIKEY"] = "env-key"
+        up, key = server._resolve_routing()
+        self.assertEqual(up, "https://env.example")
+        self.assertEqual(key, "env-key")
+
+    def test_os_env_var_beats_default_when_nothing_else_set(self):
+        os.environ["ROLLING_CONTEXT_UPSTREAM"] = "https://env.example"
+        os.environ["ROLLING_CONTEXT_APIKEY"] = "env-key"
+        up, key = server._resolve_routing()
+        self.assertEqual(up, "https://env.example")
+        self.assertEqual(key, "env-key")
+
+    def test_settings_env_beats_os_env_and_config(self):
+        self._write_config({"upstream": "https://config.example", "apikey": "cfg-key"})
+        self._write_settings({
+            "ROLLING_CONTEXT_UPSTREAM": "https://settings.example",
+            "ROLLING_CONTEXT_APIKEY": "settings-key",
+        })
+        os.environ["ROLLING_CONTEXT_UPSTREAM"] = "https://env.example"
+        os.environ["ROLLING_CONTEXT_APIKEY"] = "env-key"
+        up, key = server._resolve_routing()
+        self.assertEqual(up, "https://settings.example")
+        self.assertEqual(key, "settings-key")
+
+    def test_reads_live_not_cached(self):
+        # 核心行为:同一进程内两次调用,中途改文件,第二次调用必须看到新值——不能有模块级缓存。
+        self._write_config({"upstream": "https://first.example"})
+        up1, _ = server._resolve_routing()
+        self.assertEqual(up1, "https://first.example")
+        self._write_config({"upstream": "https://second.example"})
+        up2, _ = server._resolve_routing()
+        self.assertEqual(up2, "https://second.example")
 
 
 if __name__ == "__main__":

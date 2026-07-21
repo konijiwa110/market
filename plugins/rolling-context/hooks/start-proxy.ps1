@@ -176,21 +176,24 @@ try {
     }
 
     if ($proxyHealthy) {
+        # 链上游:无论是否配了 config upstream 都要先尝试——config 只是兜底默认配置(server.py
+        # 1.21.8 起 settings.json > OS 环境变量 > config),用户手改 settings.json 的
+        # ANTHROPIC_BASE_URL(或换鉴权/切服务商)必须能压过它。之前只在「无 config upstream」时
+        # 才链,导致 HasConfigUpstream=true 时用户的手改会被这里无条件覆盖、永远活不到 server.py
+        # 读取的那一刻。
+        $existingUrl = $null
+        if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
+            $existingUrl = $settings.env.ANTHROPIC_BASE_URL
+        }
+        if ($existingUrl -and ($existingUrl -notmatch "127\.0\.0\.1.*$Port")) {
+            # 链上已有真上游 → 存起来给 server.py 用,再把 claude 指向代理。
+            $settings.env | Add-Member -NotePropertyName "ROLLING_CONTEXT_UPSTREAM" -NotePropertyValue $existingUrl -Force
+            Log "Chaining upstream=$existingUrl"
+        }
+        $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
         if ($HasConfigUpstream) {
-            # 权威模式:上游来自 config（server.py 直接读），这里只把 claude 指向本地代理。
-            $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
-            Log "BASE_URL=$ProxyUrl upstream=$($Cfg.upstream) (config)"
+            Log "BASE_URL=$ProxyUrl (config upstream=$($Cfg.upstream) as fallback default)"
         } else {
-            $existingUrl = $null
-            if ($settings.env | Get-Member -Name "ANTHROPIC_BASE_URL" -MemberType NoteProperty) {
-                $existingUrl = $settings.env.ANTHROPIC_BASE_URL
-            }
-            if ($existingUrl -and ($existingUrl -notmatch "127\.0\.0\.1.*$Port")) {
-                # 链上已有真上游 → 存起来给 server.py 用,再把 claude 指向代理。
-                $settings.env | Add-Member -NotePropertyName "ROLLING_CONTEXT_UPSTREAM" -NotePropertyValue $existingUrl -Force
-                Log "Chaining upstream=$existingUrl"
-            }
-            $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $ProxyUrl -Force
             # 仅无 config 时写 env 默认(有 config 时由 server.py 从 config 读,不污染 settings.json)。
             $defaults = @{
                 "ROLLING_CONTEXT_PORT"    = "5588"

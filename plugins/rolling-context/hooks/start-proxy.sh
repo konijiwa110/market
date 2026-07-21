@@ -255,18 +255,20 @@ has_cfg_upstream = bool(cfg.get("upstream"))
 local_marker = proxy_url.split("//", 1)[-1]  # 127.0.0.1:PORT
 
 if healthy:
+    # 链上游:无论是否配了 config upstream 都要先尝试——config 只是兜底默认配置(server.py
+    # 1.21.8 起 settings.json > OS 环境变量 > config),用户手改 settings.json 的
+    # ANTHROPIC_BASE_URL(或换鉴权/切服务商)必须能压过它。之前只在「无 config upstream」时才链,
+    # 导致 has_cfg_upstream=True 时用户的手改会被无条件覆盖、永远活不到 server.py 读取的那一刻。
+    existing = env.get("ANTHROPIC_BASE_URL", "")
+    msgs = []
+    if existing and local_marker not in existing:
+        env["ROLLING_CONTEXT_UPSTREAM"] = existing
+        msgs.append("chaining upstream=%s" % existing)
+    env["ANTHROPIC_BASE_URL"] = proxy_url
     if has_cfg_upstream:
-        # 权威:上游来自 config(server.py 直读),这里只把 claude 指向本地代理。
-        env["ANTHROPIC_BASE_URL"] = proxy_url
-        print("ok: BASE_URL=%s upstream=%s (config)" % (proxy_url, cfg["upstream"]))
+        msgs.append("BASE_URL=%s (config upstream=%s as fallback default)" % (proxy_url, cfg["upstream"]))
     else:
-        existing = env.get("ANTHROPIC_BASE_URL", "")
-        if existing and local_marker not in existing:
-            env["ROLLING_CONTEXT_UPSTREAM"] = existing
-            print("ok: chaining upstream=%s" % existing)
-        else:
-            print("ok: BASE_URL=%s" % proxy_url)
-        env["ANTHROPIC_BASE_URL"] = proxy_url
+        # 仅无 config 时写 env 默认(有 config 时由 server.py 从 config 读,不污染 settings.json)。
         for k, v in {
             "ROLLING_CONTEXT_PORT": "5588",
             "ROLLING_CONTEXT_TRIGGER": "160000",
@@ -274,6 +276,8 @@ if healthy:
             "ROLLING_CONTEXT_MODEL": "claude-haiku-4-5-20251001",
         }.items():
             env.setdefault(k, v)
+        msgs.append("BASE_URL=%s" % proxy_url)
+    print("ok: " + "; ".join(msgs))
 else:
     # FAIL-OPEN:代理没起来 → BASE_URL 指回真上游(或移除回落官方 API),让 CC 照常工作。
     fail_target = ""

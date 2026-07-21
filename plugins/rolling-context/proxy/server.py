@@ -136,41 +136,53 @@ PID_FILE = os.path.join(_CLAUDE_DIR, "rolling-context-proxy.pid")
 VER_FILE = os.path.join(_CLAUDE_DIR, "rolling-context-proxy.version")
 
 
-def _load_upstream() -> str:
-    """Resolve the upstream API endpoint.
-
-    Prefer ROLLING_CONTEXT_UPSTREAM from the environment. The hook writes it into
-    settings.json but does not export it into this process (issue #3), so fall
-    back to reading settings.json directly — this is what lets the proxy work
-    with custom endpoints (DeepSeek, OpenRouter, a local proxy, a chained PII
-    proxy) instead of always hitting api.anthropic.com.
-    """
-    up = CONFIG.get("upstream")
-    if up:
-        return up
-    up = os.environ.get("ROLLING_CONTEXT_UPSTREAM")
-    if up:
-        return up
+def _read_settings_env() -> dict:
+    """现读 ~/.claude/settings.json 的 env 块(utf-8-sig 容忍 PowerShell 写出的 BOM),失败返回 {}。
+    不做进程级缓存——upstream/apikey 解析靠这个保证「改了 settings.json,下一发请求立即生效」。"""
     try:
-        settings_path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
-        # utf-8-sig：settings.json 可能由 PowerShell 写出带 BOM，纯 utf-8 会解析失败
-        # 而退回 api.anthropic.com（用第三方 token 打 Anthropic → 403）。
-        with open(settings_path, encoding="utf-8-sig") as f:
-            env_vars = (json.load(f) or {}).get("env", {}) or {}
-        up = env_vars.get("ROLLING_CONTEXT_UPSTREAM")
-        if up:
-            return up
-        # Last resort: a custom ANTHROPIC_BASE_URL — but never route back at
-        # ourselves (that would loop).
+        p = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+        with open(p, encoding="utf-8-sig") as f:
+            return (json.load(f) or {}).get("env", {}) or {}
+    except Exception:
+        return {}
+
+
+def _resolve_routing() -> tuple:
+    """实时解析上游 URL + 显式 apikey 覆盖:每次调用现读 rolling-context.json + settings.json,
+    不做进程级缓存。优先级:settings.json env 块 > OS 环境变量 > rolling-context.json(兜底默认
+    配置)> 内置默认。
+
+    1.21.8 前是 rolling-context.json 权重最高、且只在进程启动时算一次存成模块级常量——代理靠
+    hook 版本闸门常驻数天不重启,用户改 settings.json 的 baseURL 或换鉴权/切换上游服务商,代理
+    永远追不上,请求带着不匹配的 upstream/apikey 必然连接失败或鉴权失败,还得手动改/删
+    rolling-context.json 外加重启代理才能恢复。
+
+    settings.json 排最前:它是 hook 每次 SessionStart 都会刷新的「活的」配置,用户改了立刻生效。
+    OS 环境变量排第二(压过 rolling-context.json,但压不过 settings.json):比如用户直接在 shell/
+    系统层面设了 ROLLING_CONTEXT_UPSTREAM,应当能覆盖 rolling-context.json 里的显式配置,但如果
+    settings.json 里也写了(多半是 hook 刚链过的用户手改值),那个更新、更贴近用户此刻意图,优先
+    生效。rolling-context.json 仅作兜底默认配置。返回 (upstream_url, apikey)。"""
+    env_vars = _read_settings_env()
+    cfg = _load_config()  # 现读,不用模块级 CONFIG 缓存
+
+    up = env_vars.get("ROLLING_CONTEXT_UPSTREAM")
+    if not up:
+        # settings.json 里没有专用键时,退而求其次看 claude 自己的 ANTHROPIC_BASE_URL——
+        # 但绝不回指自己(会形成死循环)。
         base = env_vars.get("ANTHROPIC_BASE_URL", "")
         if base and (urlparse(base).port or 0) != LISTEN_PORT:
-            return base
-    except Exception:
-        pass
-    return "https://api.anthropic.com"
+            up = base
+    up = (up
+          or os.environ.get("ROLLING_CONTEXT_UPSTREAM")
+          or cfg.get("upstream")
+          or "https://api.anthropic.com")
+
+    key = (env_vars.get("ROLLING_CONTEXT_APIKEY")
+           or os.environ.get("ROLLING_CONTEXT_APIKEY")
+           or cfg.get("apikey") or "")
+    return up, key
 
 
-UPSTREAM_URL = _load_upstream()
 TRIGGER_TOKENS = int(_cfg("trigger", "ROLLING_CONTEXT_TRIGGER", 160000))
 TARGET_TOKENS = int(_cfg("target", "ROLLING_CONTEXT_TARGET", 40000))
 # 真实上下文窗口判定:代理只看请求体,本不知模型窗口是 200k 还是 1M。CC 用 model[1m] 时会带
@@ -183,8 +195,7 @@ TRIGGER_SAFETY = 0.9            # 有效 trigger 占真实窗口的比例(留 10
 _BETA_1M_MARK = "context-1m"   # 子串匹配,对日期后缀(context-1m-2025-08-07)变化稳健
 CONTEXT_WINDOW_OVERRIDE = int(_cfg("context_window", "ROLLING_CONTEXT_CONTEXT_WINDOW", 0))  # 0=未设,走头判定
 SUMMARIZER_MODEL = _cfg("model", "ROLLING_CONTEXT_MODEL", "claude-haiku-4-5-20251001")
-# 鉴权：config 显式给了才用，否则透传 claude 发来的 ANTHROPIC_AUTH_TOKEN（默认不写）。
-APIKEY = _cfg("apikey", "ROLLING_CONTEXT_APIKEY", "")
+# 鉴权与 upstream 改由 _resolve_routing() 每请求现取(1.21.8),不再是模块级冻结常量。
 # 永不超发兜底:未命中缓存时若上游以「prompt too long」拒绝超限请求,就同步压一次并重试一发,
 # CC 端永不看到这发 400(也让 CC 自己的 autoCompact/`/compact` 那发超限摘要请求被压住、得以成功,
 # 把真实 transcript 焊小 → 停插件后也不再全量重跑)。默认开;设 0/false/off 关闭回到旧的裸发行为。
@@ -217,8 +228,9 @@ ARCHIVE_MIN_MS = int(_cfg("archive_min_ms", "ROLLING_CONTEXT_ARCHIVE_MIN_MS", 90
 ARCHIVE_CAP_MB = int(_cfg("archive_cap_mb", "ROLLING_CONTEXT_ARCHIVE_CAP_MB", 200))
 
 ssl_ctx = ssl.create_default_context()
-_parsed_upstream = urlparse(UPSTREAM_URL)
-UPSTREAM_PATH = _parsed_upstream.path or ""
+# 进程刚起时取一次做占位初值(banner 日志 + compressor 构造用);实际转发/压缩请求一律现取
+# _resolve_routing(),这里的值只活到第一次请求/压缩发生之前。
+_INITIAL_UPSTREAM, _INITIAL_APIKEY = _resolve_routing()
 
 
 def _join_path(upstream_path: str, request_path: str) -> str:
@@ -238,24 +250,24 @@ compressor = RollingCompressor(
     trigger_tokens=TRIGGER_TOKENS,
     target_tokens=TARGET_TOKENS,
     summarizer_model=SUMMARIZER_MODEL,
-    summarizer_url=UPSTREAM_URL,  # 摘要走同一上游（修复原版固定打 api.anthropic.com，对第三方 baseURL 失效）
-    summarizer_api_key=APIKEY or None,  # 空则压缩器透传 claude 的鉴权（从环境读）
+    summarizer_url=_INITIAL_UPSTREAM,  # 摘要走同一上游;每次压缩前会现取最新值覆盖(见 _resolve_routing 调用点)
+    summarizer_api_key=_INITIAL_APIKEY or None,
 )
 
 
-def _upstream_conn():
-    """Create a connection to the upstream server."""
-    if _parsed_upstream.scheme == "https":
+def _upstream_conn(parsed):
+    """Create a connection to the upstream server described by `parsed` (urlparse 结果,由调用方现取)。"""
+    if parsed.scheme == "https":
         return http.client.HTTPSConnection(
-            _parsed_upstream.hostname,
-            _parsed_upstream.port or 443,
+            parsed.hostname,
+            parsed.port or 443,
             context=ssl_ctx,
             timeout=600,
         )
     else:
         return http.client.HTTPConnection(
-            _parsed_upstream.hostname,
-            _parsed_upstream.port or 80,
+            parsed.hostname,
+            parsed.port or 80,
             timeout=600,
         )
 
@@ -1020,18 +1032,19 @@ DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashb
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _apply_apikey(headers: dict) -> dict:
-    """config/env 显式给了 apikey 才覆盖上游鉴权；否则透传 claude 发来的 ANTHROPIC_AUTH_TOKEN（即从环境读）。"""
-    if not APIKEY:
+def _apply_apikey(headers: dict, apikey: str) -> dict:
+    """apikey 非空才覆盖上游鉴权(现取值,见 _resolve_routing);否则透传 claude 发来的
+    ANTHROPIC_AUTH_TOKEN。"""
+    if not apikey:
         return headers
     lowered = {k.lower(): k for k in headers}
     if "x-api-key" in lowered:
         headers.pop(lowered["x-api-key"], None)
-    headers[lowered.get("authorization", "Authorization")] = f"Bearer {APIKEY}"
+    headers[lowered.get("authorization", "Authorization")] = f"Bearer {apikey}"
     return headers
 
 
-def _forward_headers(req_headers: dict, body: bytes = None, strip_encoding: bool = False) -> dict:
+def _forward_headers(req_headers: dict, body: bytes = None, strip_encoding: bool = False, apikey: str = "") -> dict:
     headers = {}
     for key, value in req_headers.items():
         lower = key.lower()
@@ -1042,7 +1055,7 @@ def _forward_headers(req_headers: dict, body: bytes = None, strip_encoding: bool
         headers[key] = value
     if body is not None:
         headers["content-length"] = str(len(body))
-    _apply_apikey(headers)
+    _apply_apikey(headers, apikey)
     log.debug(f"[HDR] Forwarding headers: {list(headers.keys())}")
     return headers
 
@@ -1293,6 +1306,9 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict, 
     auth_headers = _apply_disguise(auth_headers)  # 套「最近大请求」伪装头模板(开关关/无模板则原样)
     # 后台线程不继承请求线程的会话标签,显式重设,使 [BG]/压缩器日志归属到发起会话。
     _set_sess(sess)
+    upstream_url, apikey = _resolve_routing()  # 现取,避免摘要请求用到进程启动时的陈旧 upstream/apikey
+    compressor.summarizer_url = upstream_url
+    compressor.summarizer_api_key = apikey or None
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
         compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real_token_count, client_meta=client_meta)
@@ -1340,6 +1356,9 @@ def _emergency_compress(messages: list, auth_headers: dict, reported_tokens, msg
     msg_chars/3 粗估兜底。"""
     real = reported_tokens or (msg_chars // 3 if msg_chars else None)
     auth_headers = _apply_disguise(auth_headers)  # 套「最近大请求」伪装头模板(开关关/无模板则原样)
+    upstream_url, apikey = _resolve_routing()  # 现取,避免摘要请求用到进程启动时的陈旧 upstream/apikey
+    compressor.summarizer_url = upstream_url
+    compressor.summarizer_api_key = apikey or None
     compressed, prefix_len = compressor.compress(messages, auth_headers, real_token_count=real, client_meta=client_meta)
     if prefix_len == 0:
         log.warning("[EMG] Nothing to compress (prefix_len=0); cannot shrink request")
@@ -1381,14 +1400,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _proxy_raw(self, method: str):
         """Raw proxy — forward request and stream response back."""
+        upstream_url, apikey = _resolve_routing()
+        upstream_parsed = urlparse(upstream_url)
         body = self._read_body()
-        headers = _forward_headers(self._get_headers_dict(), body if body else None)
+        headers = _forward_headers(self._get_headers_dict(), body if body else None, apikey=apikey)
 
-        log.info(f"[RAW] {method} {self.path} -> {UPSTREAM_URL} (body={len(body)} bytes)")
+        log.info(f"[RAW] {method} {self.path} -> {upstream_url} (body={len(body)} bytes)")
 
         try:
-            conn = _upstream_conn()
-            upstream_full_path = _join_path(UPSTREAM_PATH, self.path)
+            conn = _upstream_conn(upstream_parsed)
+            upstream_full_path = _join_path(upstream_parsed.path or "", self.path)
             conn.request(method, upstream_full_path, body=body if body else None, headers=headers)
             resp = conn.getresponse()
 
@@ -1510,6 +1531,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 避免硬杀切断在途 SSE(对端 RST → 旧会话看到 502)。
         with _inflight_lock:
             inflight = len(_inflight)
+        upstream_url, _ = _resolve_routing()  # 现取,让 /health 反映此刻真实生效的上游,而非启动时快照
         data = {
             "status": "ok",
             "version": VERSION,
@@ -1517,7 +1539,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "trigger_tokens": TRIGGER_TOKENS,
             "target_tokens": TARGET_TOKENS,
             "summarizer_model": SUMMARIZER_MODEL,
-            "upstream_url": UPSTREAM_URL,
+            "upstream_url": upstream_url,
             "compression_count": compressor.compression_count,
             "total_tokens_saved": compressor.total_tokens_saved,
             "stored_compressions": len(store.compressions),
@@ -1563,9 +1585,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 hours = float(hours_raw)
             except ValueError:
                 hours = 24.0
+        stats_upstream_url, _ = _resolve_routing()  # 现取,反映此刻真实生效的上游
         extra = {
             "version": VERSION,
-            "upstream_url": UPSTREAM_URL,
+            "upstream_url": stats_upstream_url,
             "summarizer_model": SUMMARIZER_MODEL,
             "trigger_tokens": TRIGGER_TOKENS,
             "target_tokens": TARGET_TOKENS,
@@ -1652,6 +1675,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         t_recv = time.perf_counter()
         ts_epoch = time.time()
         is_count = "count_tokens" in self.path
+        # 本次请求现取 upstream/apikey(_resolve_routing 不缓存),整发请求(含 emergency 重试)
+        # 复用同一份解析结果,避免同一发请求中途上游漂移。
+        upstream_url, apikey = _resolve_routing()
+        upstream_parsed = urlparse(upstream_url)
 
         raw_body = self._read_body()
         req_headers = self._get_headers_dict()
@@ -1839,9 +1866,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 body = json.dumps(payload).encode()  # payload 已改写,重编码
 
         # Forward request — strip Accept-Encoding so we get plain text SSE
-        headers = _forward_headers(req_headers, body, strip_encoding=True)
+        headers = _forward_headers(req_headers, body, strip_encoding=True, apikey=apikey)
 
-        log.info(f"[MSG] Forwarding to {UPSTREAM_URL}{self.path} ({len(body):,} bytes)")
+        log.info(f"[MSG] Forwarding to {upstream_url}{self.path} ({len(body):,} bytes)")
 
         # 本次请求的统计记录,在 try 内逐步填充(token/状态/耗时),finally 落库一次。
         record = {
@@ -1874,8 +1901,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _inflight.append(record)
 
         try:
-            conn = _upstream_conn()
-            upstream_full_path = _join_path(UPSTREAM_PATH, self.path)
+            conn = _upstream_conn(upstream_parsed)
+            upstream_full_path = _join_path(upstream_parsed.path or "", self.path)
             t_fwd = time.perf_counter()  # 转发上游的时刻;首字延迟 = t_first - t_fwd
             conn.request("POST", upstream_full_path, body=body, headers=headers)
             resp = conn.getresponse()
@@ -1911,10 +1938,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         current_messages = new_msgs
                         msg_chars = compressor._count_chars(new_msgs)
                         body = json.dumps(payload).encode()
-                        headers = _forward_headers(req_headers, body, strip_encoding=True)
+                        headers = _forward_headers(req_headers, body, strip_encoding=True, apikey=apikey)
                         record["emergency"] = True
                         record["injected"] = injected = True
-                        conn = _upstream_conn()
+                        conn = _upstream_conn(upstream_parsed)
                         t_fwd = time.perf_counter()  # 重置:压缩耗时计入 overhead,prefill 仍只量上游
                         conn.request("POST", upstream_full_path, body=body, headers=headers)
                         resp = conn.getresponse()
@@ -2218,7 +2245,7 @@ def main():
     log.info(f"  Effective trigger capped at {int(TRIGGER_SAFETY*100)}% of detected window")
     log.info(f"  Compress down to: {TARGET_TOKENS:,} tokens (recent context)")
     log.info(f"  Summarizer model: {SUMMARIZER_MODEL}")
-    log.info(f"  Forwarding to: {UPSTREAM_URL}")
+    log.info(f"  Forwarding to: {_INITIAL_UPSTREAM}")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
     log.info(f"  Disguise client: {'on (mimic latest large request headers)' if DISGUISE_CLIENT else 'off (passthrough current request headers)'}")
 
